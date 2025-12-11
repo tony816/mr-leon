@@ -1,4 +1,7 @@
+import argparse
 import os
+import platform
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -140,6 +143,54 @@ def resolve_code(user_text: str) -> Optional[str]:
     return NAME_TO_CODE.get(lowered)
 
 
+def load_keys() -> tuple[str, str, Optional[str]]:
+    app_key = os.getenv("KIS_APP_KEY")
+    app_secret = os.getenv("KIS_APP_SECRET")
+    base_url = os.getenv("KIS_BASE_URL")
+    if not app_key or not app_secret:
+        raise KisError(".env 파일 또는 환경변수에 KIS_APP_KEY, KIS_APP_SECRET을 설정하세요.")
+    return app_key, app_secret, base_url
+
+
+def run_cli(symbol: Optional[str]) -> int:
+    user_input = symbol or input("종목코드 6자리 또는 사전 등록된 이름을 입력하세요: ").strip()
+    code = resolve_code(user_input)
+    if not code:
+        print("입력 오류: 종목코드 6자리 또는 사전 등록된 이름을 입력하세요.", file=sys.stderr)
+        return 1
+
+    try:
+        app_key, app_secret, base_url = load_keys()
+        client = KisClient(app_key, app_secret, base_url=base_url)
+        snapshot = client.get_price_snapshot(code)
+    except Exception as exc:  # broad catch for a simple CLI
+        print(f"조회 실패: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{snapshot.name} ({snapshot.code})")
+    print(f"현재가: {snapshot.price}")
+    print(f"PER: {snapshot.per}")
+    print(f"PBR: {snapshot.pbr}")
+    return 0
+
+
+def gui_supported() -> tuple[bool, Optional[str]]:
+    if sys.platform != "darwin":
+        return True, None
+
+    release = platform.mac_ver()[0] or ""
+    parts = release.split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return True, None
+
+    if major == 14 and minor < 7:
+        return False, f"현재 macOS {release}에서는 내장 Tk GUI가 동작하지 않습니다 (14.7 이상 필요). --cli 모드를 사용하세요."
+    return True, None
+
+
 def build_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox
@@ -238,4 +289,19 @@ def build_gui():
 
 
 if __name__ == "__main__":
-    build_gui()
+    parser = argparse.ArgumentParser(description="한국투자 PER/PBR 뷰어")
+    parser.add_argument("--cli", action="store_true", help="GUI 대신 터미널 모드로 실행합니다.")
+    parser.add_argument("--symbol", help="--cli 모드에서 사용할 종목코드 또는 이름입니다.")
+    args = parser.parse_args()
+
+    can_gui, reason = gui_supported()
+    if args.cli or not can_gui:
+        if reason and not args.cli:
+            print(reason)
+        sys.exit(run_cli(args.symbol))
+
+    try:
+        build_gui()
+    except Exception as exc:
+        print(f"GUI 실행에 실패했습니다: {exc}\n대신 --cli 모드로 전환합니다.")
+        sys.exit(run_cli(args.symbol))
