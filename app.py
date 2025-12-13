@@ -291,8 +291,16 @@ def _sum_or_none(values) -> Optional[int]:
     return sum(filtered) if filtered else None
 
 
+def compute_net_cash(liquid_funds: Optional[int], interest_bearing_debt: Optional[int]):
+    """Return (net_cash, debt_value) applying debt=0 fallback when liquid_funds exists."""
+    if liquid_funds is None:
+        return None, interest_bearing_debt
+    debt_value = interest_bearing_debt if interest_bearing_debt is not None else 0
+    return liquid_funds - debt_value, debt_value
+
+
 def parse_stock_totals(entries) -> Optional[int]:
-    """Pick distb_stock_co from stockTotqySttus entries, preferring common stock rows."""
+    """Compute 유통주식수(Ⅵ) preferring distb_stock_co and falling back to (발행주식 - 자사주)."""
     if not entries:
         return None
     chosen = None
@@ -303,7 +311,25 @@ def parse_stock_totals(entries) -> Optional[int]:
             break
     if not chosen:
         chosen = entries[0]
-    return _parse_int((chosen or {}).get("distb_stock_co"))
+    entry = chosen or {}
+
+    distb_stock = _parse_int(entry.get("distb_stock_co"))
+    if distb_stock and distb_stock > 0:
+        return distb_stock
+
+    now_to_isu = _parse_int(entry.get("now_to_isu_stock_totqy"))
+    now_to_dcrs = _parse_int(entry.get("now_to_dcrs_stock_totqy")) or 0
+    tesstk = _parse_int(entry.get("tesstk_co")) or 0
+
+    if now_to_isu is None:
+        return None
+
+    issued_total = now_to_isu - now_to_dcrs
+    if issued_total <= 0:
+        return None
+
+    float_shares = issued_total - tesstk
+    return float_shares if float_shares > 0 else None
 
 
 def fetch_dart_stock_totals(corp_code: str, bsns_year: str, reprt_code: str) -> Optional[int]:
@@ -387,17 +413,17 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
             [short_borrowings, current_long_term_debt, bonds, long_borrowings]
         )
 
-        net_cash = liquid_funds - interest_bearing_debt if liquid_funds is not None and interest_bearing_debt is not None else None
+        net_cash, debt_value = compute_net_cash(liquid_funds, interest_bearing_debt)
 
-        distb_stock_co = None
+        float_shares = None
         try:
-            distb_stock_co = fetch_dart_stock_totals(corp_code, year, reprt_code)
+            float_shares = fetch_dart_stock_totals(corp_code, year, reprt_code)
         except Exception:
-            distb_stock_co = None
+            float_shares = None
 
-        net_cash_per_share = format_per_share(net_cash, distb_stock_co)
+        net_cash_per_share = format_per_share(net_cash, float_shares)
         net_cash_display = format_amount(net_cash) if net_cash is not None else "N/A"
-        distb_stock_display = format_amount(distb_stock_co) if distb_stock_co is not None else None
+        float_shares_display = format_amount(float_shares) if float_shares is not None else None
 
         return {
             "corp_name": corp_name,
@@ -407,11 +433,11 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
             "summary": summary,
             "cash_equivalents": format_amount(cash_equivalents) if cash_equivalents is not None else "N/A",
             "liquid_funds": liquid_funds,
-            "interest_bearing_debt": interest_bearing_debt,
+            "interest_bearing_debt": debt_value,
             "net_cash": net_cash,
             "net_cash_display": net_cash_display,
-            "distb_stock_co": distb_stock_co,
-            "distb_stock_display": distb_stock_display,
+            "float_shares": float_shares,
+            "float_shares_display": float_shares_display,
             "net_cash_per_share": net_cash_per_share,
         }
 
@@ -765,7 +791,6 @@ def build_gui():
                     price_var.set(snapshot.price),
                     per_var.set(snapshot.per),
                     pbr_var.set(snapshot.pbr),
-                    cash_var.set(snapshot.cash),
                     debt_var.set(snapshot.debt_ratio),
                 ),
             )
@@ -774,10 +799,12 @@ def build_gui():
         try:
             if dart_data:
                 summary = dart_data.get("summary", {}) if isinstance(dart_data, dict) else {}
+                liquid_display = format_amount(dart_data.get("liquid_funds"))
                 root.after(
                     0,
                     lambda: (
                         dart_year_var.set(dart_data.get("bsns_year", "-")),
+                        cash_var.set(liquid_display),
                         dart_net_cash_ps_var.set(dart_data.get("net_cash_per_share", "N/A")),
                         dart_net_cash_var.set(dart_data.get("net_cash_display", "N/A")),
                         dart_sales_var.set(summary.get("매출액", "N/A")),
@@ -793,6 +820,7 @@ def build_gui():
                     0,
                     lambda: (
                         dart_year_var.set("-"),
+                        cash_var.set("-"),
                         dart_net_cash_ps_var.set("-"),
                         dart_net_cash_var.set("-"),
                         dart_sales_var.set("-"),
@@ -874,7 +902,7 @@ def build_gui():
     add_row("Price", price_var, 2)
     add_row("PER", per_var, 3)
     add_row("PBR", pbr_var, 4)
-    add_row("현금(KIS)", cash_var, 5)
+    add_row("현금성자산(DART)", cash_var, 5)
     add_row("Debt ratio", debt_var, 6)
     add_row("사업연도(DART)", dart_year_var, 7)
     add_row("주당 순현금", dart_net_cash_ps_var, 8)
