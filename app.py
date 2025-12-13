@@ -173,6 +173,14 @@ ACCOUNT_SYNONYMS = {
     "자산총계": {"자산총계", "자산총액"},
     "부채총계": {"부채총계", "부채총액"},
     "자본총계": {"자본총계", "자본총액"},
+    "단기금융상품": {"단기금융상품", "shorttermfinancialproducts"},
+    "단기상각후원가금융자산": {"단기상각후원가금융자산", "amortizedcostshorttermfinancialassets"},
+    "단기당기손익-공정가치금융자산": {
+        "단기당기손익-공정가치금융자산",
+        "단기당기손익공정가치금융자산",
+        "단기당기손익-공정가치-금융자산",
+        "shorttermfvplfinancialassets",
+    },
     "현금및현금성자산": {
         "현금및현금성자산",
         "현금및현금성자산및예치금",
@@ -182,6 +190,12 @@ ACCOUNT_SYNONYMS = {
         "cashandcashequivalents",
         "cash_and_cash_equivalents",
     },
+    "단기차입금": {"단기차입금", "shorttermborrowings"},
+    "유동성장기부채": {"유동성장기부채", "currentportionoflongtermliabilities"},
+    "유동성장기차입금": {"유동성장기차입금", "currentportionoflongtermborrowings"},
+    "유동성사채": {"유동성사채", "currentportionofbonds"},
+    "사채": {"사채", "회사채", "bonds"},
+    "장기차입금": {"장기차입금", "longtermborrowings"},
 }
 
 ACCOUNT_ALIAS_MAP = {normalize_name(alias): key for key, aliases in ACCOUNT_SYNONYMS.items() for alias in aliases}
@@ -214,6 +228,27 @@ def format_per_share(cash_value: Optional[int], shares: Optional[int]) -> str:
     return f"{cash_value / shares:,.2f}"
 
 
+def find_account_amount(entries, target_key: str) -> Optional[int]:
+    """Find the first matching account amount for the target key using alias map."""
+    if not entries:
+        return None
+    normalized_target = normalize_name(target_key)
+    for row in entries:
+        account_nm = (row.get("account_nm") or "").strip()
+        if not account_nm:
+            continue
+        normalized_name = normalize_name(account_nm)
+        key = ACCOUNT_ALIAS_MAP.get(normalized_name)
+        # Allow direct normalized match even when alias map is missing.
+        if not ((key and key == target_key) or (normalized_name == normalized_target)):
+            continue
+        val = row.get("thstrm_amount") or row.get("thstrm_add_amount")
+        amt = parse_amount(val)
+        if amt is not None:
+            return amt
+    return None
+
+
 def summarize_accounts(entries) -> Dict[str, str]:
     summary = {key: "N/A" for key in ACCOUNT_SYNONYMS}
     for row in entries or []:
@@ -227,8 +262,7 @@ def summarize_accounts(entries) -> Dict[str, str]:
     return summary
 
 
-def fetch_dart_cash_equivalents(corp_code: str, bsns_year: str, reprt_code: str) -> Optional[int]:
-    """Fetch cash & cash equivalents from DART single-account-all API."""
+def fetch_dart_single_accounts(corp_code: str, bsns_year: str, reprt_code: str):
     params = {
         "crtfc_key": get_dart_key(),
         "corp_code": corp_code,
@@ -238,20 +272,38 @@ def fetch_dart_cash_equivalents(corp_code: str, bsns_year: str, reprt_code: str)
     }
     resp = requests.get(DART_SINGLE_ACNT_URL, params=params, timeout=15)
     if resp.status_code != 200:
-        raise DartError(f"현금및현금성자산 조회 실패: HTTP {resp.status_code}")
+        raise DartError(f"단일계정 조회 실패: HTTP {resp.status_code}")
     payload = resp.json()
     if payload.get("status") != "000":
-        raise DartError(f"현금및현금성자산 조회 오류: {payload.get('status')} {payload.get('message', '')}".strip())
+        raise DartError(f"단일계정 조회 오류: {payload.get('status')} {payload.get('message', '')}".strip())
+    return payload.get("list") or []
 
-    entries = payload.get("list") or []
-    for row in entries:
-        account_nm = (row.get("account_nm") or "").strip()
-        if not account_nm:
-            continue
-        label = ACCOUNT_ALIAS_MAP.get(normalize_name(account_nm))
-        if label == "현금및현금성자산":
-            return parse_amount(row.get("thstrm_amount") or row.get("thstrm_add_amount"))
-    return None
+
+def _parse_int(value) -> Optional[int]:
+    try:
+        return int(float(str(value).replace(",", "")))
+    except Exception:
+        return None
+
+
+def _sum_or_none(values) -> Optional[int]:
+    filtered = [v for v in values if v is not None]
+    return sum(filtered) if filtered else None
+
+
+def parse_stock_totals(entries) -> Optional[int]:
+    """Pick distb_stock_co from stockTotqySttus entries, preferring common stock rows."""
+    if not entries:
+        return None
+    chosen = None
+    for entry in entries:
+        se = str(entry.get("se", "")).lower()
+        if "보통" in se or "common" in se:
+            chosen = entry
+            break
+    if not chosen:
+        chosen = entries[0]
+    return _parse_int((chosen or {}).get("distb_stock_co"))
 
 
 def fetch_dart_stock_totals(corp_code: str, bsns_year: str, reprt_code: str) -> Optional[int]:
@@ -270,27 +322,7 @@ def fetch_dart_stock_totals(corp_code: str, bsns_year: str, reprt_code: str) -> 
         raise DartError(f"주식 총수 조회 오류: {payload.get('status')} {payload.get('message', '')}".strip())
 
     entries = payload.get("list") or []
-    if not entries:
-        return None
-    entry = entries[0] or {}
-
-    def _parse(val):
-        try:
-            return int(float(str(val).replace(",", "")))
-        except Exception:
-            return None
-
-    issued = _parse(entry.get("now_to_isu_stock_totqy"))
-    decreased = _parse(entry.get("now_to_dcrs_stock_totqy"))
-    istc_totqy = _parse(entry.get("istc_totqy"))
-
-    if issued is not None and decreased is not None:
-        shares = issued - decreased
-        if shares > 0:
-            return shares
-    if istc_totqy is not None and istc_totqy > 0:
-        return istc_totqy
-    return None
+    return parse_stock_totals(entries)
 
 
 def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt_code: str = "11011") -> Dict[str, str]:
@@ -323,31 +355,64 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
         if not entries:
             last_error = "빈 응답"
             continue
-        summary = summarize_accounts(entries)
-        cash_value = parse_amount(summary.get("현금및현금성자산"))
-        if cash_value is None:
-            try:
-                cash_value = fetch_dart_cash_equivalents(corp_code, year, reprt_code)
-            except Exception:
-                cash_value = None
-            if cash_value is not None:
-                summary["현금및현금성자산"] = format_amount(cash_value)
-        shares = None
-        cash_per_share = None
+        single_entries = []
         try:
-            shares = fetch_dart_stock_totals(corp_code, year, reprt_code)
-            cash_per_share = format_per_share(cash_value, shares)
+            single_entries = fetch_dart_single_accounts(corp_code, year, reprt_code)
         except Exception:
-            pass
+            single_entries = []
+
+        summary = summarize_accounts(entries)
+        combined = (single_entries or []) + (entries or [])
+        cash_equivalents = find_account_amount(combined, "현금및현금성자산")
+        short_term_products = find_account_amount(combined, "단기금융상품")
+        amortized_assets = find_account_amount(combined, "단기상각후원가금융자산")
+        fvpl_assets = find_account_amount(combined, "단기당기손익-공정가치금융자산")
+
+        if cash_equivalents is not None:
+            summary["현금및현금성자산"] = format_amount(cash_equivalents)
+
+        liquid_funds = _sum_or_none([cash_equivalents, short_term_products, amortized_assets, fvpl_assets])
+
+        short_borrowings = find_account_amount(combined, "단기차입금")
+        current_long_term_debt = find_account_amount(combined, "유동성장기부채")
+        current_long_term_borrowings = find_account_amount(combined, "유동성장기차입금")
+        current_bonds = find_account_amount(combined, "유동성사채")
+        bonds = find_account_amount(combined, "사채")
+        long_borrowings = find_account_amount(combined, "장기차입금")
+
+        if current_long_term_debt is None:
+            current_long_term_debt = _sum_or_none([current_long_term_borrowings, current_bonds])
+
+        interest_bearing_debt = _sum_or_none(
+            [short_borrowings, current_long_term_debt, bonds, long_borrowings]
+        )
+
+        net_cash = liquid_funds - interest_bearing_debt if liquid_funds is not None and interest_bearing_debt is not None else None
+
+        distb_stock_co = None
+        try:
+            distb_stock_co = fetch_dart_stock_totals(corp_code, year, reprt_code)
+        except Exception:
+            distb_stock_co = None
+
+        net_cash_per_share = format_per_share(net_cash, distb_stock_co)
+        net_cash_display = format_amount(net_cash) if net_cash is not None else "N/A"
+        distb_stock_display = format_amount(distb_stock_co) if distb_stock_co is not None else None
+
         return {
             "corp_name": corp_name,
             "corp_code": corp_code,
             "bsns_year": year,
             "reprt_code": reprt_code,
             "summary": summary,
-            "cash_equivalents": format_amount(cash_value) if cash_value is not None else "N/A",
-            "shares_outstanding": shares,
-            "cash_per_share": cash_per_share or "N/A",
+            "cash_equivalents": format_amount(cash_equivalents) if cash_equivalents is not None else "N/A",
+            "liquid_funds": liquid_funds,
+            "interest_bearing_debt": interest_bearing_debt,
+            "net_cash": net_cash,
+            "net_cash_display": net_cash_display,
+            "distb_stock_co": distb_stock_co,
+            "distb_stock_display": distb_stock_display,
+            "net_cash_per_share": net_cash_per_share,
         }
 
     raise DartError(last_error or "조회 가능한 연도가 없습니다.")
@@ -621,10 +686,12 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     corp_code = result.get("corp_code", "-")
     bsns_year = result.get("bsns_year", "-")
     summary = result.get("summary", {})
-    cps = result.get("cash_per_share", "N/A")
+    ncs = result.get("net_cash_per_share", "N/A")
+    net_cash_display = result.get("net_cash_display", "N/A")
 
     print(f"{corp_name} ({corp_code}) - 사업연도 {bsns_year}")
-    print(f"1주당 현금: {cps}")
+    print(f"주당 순현금: {ncs}")
+    print(f"순현금(총액): {net_cash_display}")
     for label in ("매출액", "영업이익", "당기순이익", "자산총계", "부채총계", "자본총계"):
         print(f"{label}: {summary.get(label, 'N/A')}")
     return 0
@@ -653,7 +720,7 @@ def build_gui():
 
     root = tk.Tk()
     root.title("KIS + DART Viewer")
-    root.geometry("520x380")
+    root.geometry("540x430")
     root.resizable(False, False)
 
     root.configure(padx=14, pady=12, bg="#f7f7f7")
@@ -673,6 +740,8 @@ def build_gui():
     cash_var = tk.StringVar(value="-")
     debt_var = tk.StringVar(value="-")
     dart_year_var = tk.StringVar(value="-")
+    dart_net_cash_ps_var = tk.StringVar(value="-")
+    dart_net_cash_var = tk.StringVar(value="-")
     dart_sales_var = tk.StringVar(value="-")
     dart_op_var = tk.StringVar(value="-")
     dart_net_var = tk.StringVar(value="-")
@@ -681,48 +750,61 @@ def build_gui():
     dart_equity_var = tk.StringVar(value="-")
 
     def set_status(text: str):
-        root.after(0, lambda: status_var.set(text))
+        try:
+            root.after(0, lambda: status_var.set(text))
+        except Exception:
+            pass
 
     def update_view(snapshot: PriceSnapshot, dart_data=None):
-        root.after(
-            0,
-            lambda: (
-                name_var.set(snapshot.name),
-                code_var.set(snapshot.code),
-                price_var.set(snapshot.price),
-                per_var.set(snapshot.per),
-                pbr_var.set(snapshot.pbr),
-                cash_var.set(snapshot.cash),
-                debt_var.set(snapshot.debt_ratio),
-            ),
-        )
-        if dart_data:
-            summary = dart_data.get("summary", {}) if isinstance(dart_data, dict) else {}
+        try:
             root.after(
                 0,
                 lambda: (
-                    dart_year_var.set(dart_data.get("bsns_year", "-")),
-                    dart_sales_var.set(summary.get("매출액", "N/A")),
-                    dart_op_var.set(summary.get("영업이익", "N/A")),
-                    dart_net_var.set(summary.get("당기순이익", "N/A")),
-                    dart_asset_var.set(summary.get("자산총계", "N/A")),
-                    dart_debt_var.set(summary.get("부채총계", "N/A")),
-                    dart_equity_var.set(summary.get("자본총계", "N/A")),
+                    name_var.set(snapshot.name),
+                    code_var.set(snapshot.code),
+                    price_var.set(snapshot.price),
+                    per_var.set(snapshot.per),
+                    pbr_var.set(snapshot.pbr),
+                    cash_var.set(snapshot.cash),
+                    debt_var.set(snapshot.debt_ratio),
                 ),
             )
-        else:
-            root.after(
-                0,
-                lambda: (
-                    dart_year_var.set("-"),
-                    dart_sales_var.set("-"),
-                    dart_op_var.set("-"),
-                    dart_net_var.set("-"),
-                    dart_asset_var.set("-"),
-                    dart_debt_var.set("-"),
-                    dart_equity_var.set("-"),
-                ),
-            )
+        except Exception:
+            return
+        try:
+            if dart_data:
+                summary = dart_data.get("summary", {}) if isinstance(dart_data, dict) else {}
+                root.after(
+                    0,
+                    lambda: (
+                        dart_year_var.set(dart_data.get("bsns_year", "-")),
+                        dart_net_cash_ps_var.set(dart_data.get("net_cash_per_share", "N/A")),
+                        dart_net_cash_var.set(dart_data.get("net_cash_display", "N/A")),
+                        dart_sales_var.set(summary.get("매출액", "N/A")),
+                        dart_op_var.set(summary.get("영업이익", "N/A")),
+                        dart_net_var.set(summary.get("당기순이익", "N/A")),
+                        dart_asset_var.set(summary.get("자산총계", "N/A")),
+                        dart_debt_var.set(summary.get("부채총계", "N/A")),
+                        dart_equity_var.set(summary.get("자본총계", "N/A")),
+                    ),
+                )
+            else:
+                root.after(
+                    0,
+                    lambda: (
+                        dart_year_var.set("-"),
+                        dart_net_cash_ps_var.set("-"),
+                        dart_net_cash_var.set("-"),
+                        dart_sales_var.set("-"),
+                        dart_op_var.set("-"),
+                        dart_net_var.set("-"),
+                        dart_asset_var.set("-"),
+                        dart_debt_var.set("-"),
+                        dart_equity_var.set("-"),
+                    ),
+                )
+        except Exception:
+            pass
 
     def do_fetch():
         user_input = input_var.get()
@@ -739,28 +821,29 @@ def build_gui():
         app_key = os.getenv("KIS_APP_KEY")
         app_secret = os.getenv("KIS_APP_SECRET")
         base_url = os.getenv("KIS_BASE_URL")
-        if not app_key or not app_secret:
-            messagebox.showerror("Missing keys", "Set KIS_APP_KEY and KIS_APP_SECRET in your environment or .env file.")
-            return
-
-        client = KisClient(app_key, app_secret, base_url=base_url)
+        kis_enabled = bool(app_key and app_secret)
+        client = KisClient(app_key, app_secret, base_url=base_url) if kis_enabled else None
 
         def worker():
             set_status("Fetching...")
             dart_data = None
             dart_error = None
+            snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
             try:
-                snapshot = client.get_snapshot_with_financials(code)
-                try:
-                    dart_data = fetch_dart_financials(user_input)
-                    if dart_data and dart_data.get("cash_per_share"):
-                        snapshot.cash = dart_data.get("cash_per_share")
-                except Exception as exc:
-                    dart_error = str(exc)
+                if kis_enabled and client:
+                    snapshot = client.get_snapshot_with_financials(code)
             except Exception as exc:  # broad catch to show UI errors
-                set_status("Error")
-                messagebox.showerror("Lookup failed", str(exc))
-                return
+                set_status("KIS 실패, DART만 표시")
+                snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
+
+            try:
+                dart_data = fetch_dart_financials(user_input)
+                if dart_data and dart_data.get("corp_name"):
+                    snapshot.name = dart_data.get("corp_name")
+                if dart_data and dart_data.get("corp_code"):
+                    snapshot.code = dart_data.get("corp_code")
+            except Exception as exc:
+                dart_error = str(exc)
 
             update_view(snapshot, dart_data)
             if dart_error:
@@ -791,15 +874,17 @@ def build_gui():
     add_row("Price", price_var, 2)
     add_row("PER", per_var, 3)
     add_row("PBR", pbr_var, 4)
-    add_row("1주당 현금", cash_var, 5)
+    add_row("현금(KIS)", cash_var, 5)
     add_row("Debt ratio", debt_var, 6)
     add_row("사업연도(DART)", dart_year_var, 7)
-    add_row("매출액", dart_sales_var, 8)
-    add_row("영업이익", dart_op_var, 9)
-    add_row("당기순이익", dart_net_var, 10)
-    add_row("자산총계", dart_asset_var, 11)
-    add_row("부채총계", dart_debt_var, 12)
-    add_row("자본총계", dart_equity_var, 13)
+    add_row("주당 순현금", dart_net_cash_ps_var, 8)
+    add_row("순현금", dart_net_cash_var, 9)
+    add_row("매출액", dart_sales_var, 10)
+    add_row("영업이익", dart_op_var, 11)
+    add_row("당기순이익", dart_net_var, 12)
+    add_row("자산총계", dart_asset_var, 13)
+    add_row("부채총계", dart_debt_var, 14)
+    add_row("자본총계", dart_equity_var, 15)
 
     status_bar = ttk.Label(root, textvariable=status_var, anchor="w", relief="sunken")
     status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
