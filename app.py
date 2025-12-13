@@ -18,11 +18,13 @@ import requests
 from dotenv import load_dotenv
 
 # Load .env so users can keep keys out of the code.
-load_dotenv()
+load_dotenv(dotenv_path=".env")
 
 KRX_LISTING_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_MULTI_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttMultiAcnt.json"
+DART_STOCK_TOT_URL = "https://opendart.fss.or.kr/api/stockTotqySttus.json"
+DART_SINGLE_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
 
 
 class KisError(Exception):
@@ -171,6 +173,15 @@ ACCOUNT_SYNONYMS = {
     "자산총계": {"자산총계", "자산총액"},
     "부채총계": {"부채총계", "부채총액"},
     "자본총계": {"자본총계", "자본총액"},
+    "현금및현금성자산": {
+        "현금및현금성자산",
+        "현금및현금성자산및예치금",
+        "현금및현금성자산(유동)",
+        "현금및현금성자산(비유동)",
+        "현금및현금성자산및단기금융상품",
+        "cashandcashequivalents",
+        "cash_and_cash_equivalents",
+    },
 }
 
 ACCOUNT_ALIAS_MAP = {normalize_name(alias): key for key, aliases in ACCOUNT_SYNONYMS.items() for alias in aliases}
@@ -197,6 +208,12 @@ def format_amount(value) -> str:
     return f"{amount:,}"
 
 
+def format_per_share(cash_value: Optional[int], shares: Optional[int]) -> str:
+    if cash_value is None or shares is None or shares <= 0:
+        return "N/A"
+    return f"{cash_value / shares:,.2f}"
+
+
 def summarize_accounts(entries) -> Dict[str, str]:
     summary = {key: "N/A" for key in ACCOUNT_SYNONYMS}
     for row in entries or []:
@@ -208,6 +225,72 @@ def summarize_accounts(entries) -> Dict[str, str]:
             continue
         summary[label] = format_amount(row.get("thstrm_amount") or row.get("thstrm_add_amount"))
     return summary
+
+
+def fetch_dart_cash_equivalents(corp_code: str, bsns_year: str, reprt_code: str) -> Optional[int]:
+    """Fetch cash & cash equivalents from DART single-account-all API."""
+    params = {
+        "crtfc_key": get_dart_key(),
+        "corp_code": corp_code,
+        "bsns_year": bsns_year,
+        "reprt_code": reprt_code,
+        "fs_div": "CFS",
+    }
+    resp = requests.get(DART_SINGLE_ACNT_URL, params=params, timeout=15)
+    if resp.status_code != 200:
+        raise DartError(f"현금및현금성자산 조회 실패: HTTP {resp.status_code}")
+    payload = resp.json()
+    if payload.get("status") != "000":
+        raise DartError(f"현금및현금성자산 조회 오류: {payload.get('status')} {payload.get('message', '')}".strip())
+
+    entries = payload.get("list") or []
+    for row in entries:
+        account_nm = (row.get("account_nm") or "").strip()
+        if not account_nm:
+            continue
+        label = ACCOUNT_ALIAS_MAP.get(normalize_name(account_nm))
+        if label == "현금및현금성자산":
+            return parse_amount(row.get("thstrm_amount") or row.get("thstrm_add_amount"))
+    return None
+
+
+def fetch_dart_stock_totals(corp_code: str, bsns_year: str, reprt_code: str) -> Optional[int]:
+    params = {
+        "crtfc_key": get_dart_key(),
+        "corp_code": corp_code,
+        "bsns_year": bsns_year,
+        "reprt_code": reprt_code,
+    }
+    resp = requests.get(DART_STOCK_TOT_URL, params=params, timeout=15)
+    if resp.status_code != 200:
+        raise DartError(f"주식 총수 조회 실패: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("status") != "000":
+        raise DartError(f"주식 총수 조회 오류: {payload.get('status')} {payload.get('message', '')}".strip())
+
+    entries = payload.get("list") or []
+    if not entries:
+        return None
+    entry = entries[0] or {}
+
+    def _parse(val):
+        try:
+            return int(float(str(val).replace(",", "")))
+        except Exception:
+            return None
+
+    issued = _parse(entry.get("now_to_isu_stock_totqy"))
+    decreased = _parse(entry.get("now_to_dcrs_stock_totqy"))
+    istc_totqy = _parse(entry.get("istc_totqy"))
+
+    if issued is not None and decreased is not None:
+        shares = issued - decreased
+        if shares > 0:
+            return shares
+    if istc_totqy is not None and istc_totqy > 0:
+        return istc_totqy
+    return None
 
 
 def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt_code: str = "11011") -> Dict[str, str]:
@@ -241,12 +324,30 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
             last_error = "빈 응답"
             continue
         summary = summarize_accounts(entries)
+        cash_value = parse_amount(summary.get("현금및현금성자산"))
+        if cash_value is None:
+            try:
+                cash_value = fetch_dart_cash_equivalents(corp_code, year, reprt_code)
+            except Exception:
+                cash_value = None
+            if cash_value is not None:
+                summary["현금및현금성자산"] = format_amount(cash_value)
+        shares = None
+        cash_per_share = None
+        try:
+            shares = fetch_dart_stock_totals(corp_code, year, reprt_code)
+            cash_per_share = format_per_share(cash_value, shares)
+        except Exception:
+            pass
         return {
             "corp_name": corp_name,
             "corp_code": corp_code,
             "bsns_year": year,
             "reprt_code": reprt_code,
             "summary": summary,
+            "cash_equivalents": format_amount(cash_value) if cash_value is not None else "N/A",
+            "shares_outstanding": shares,
+            "cash_per_share": cash_per_share or "N/A",
         }
 
     raise DartError(last_error or "조회 가능한 연도가 없습니다.")
@@ -520,8 +621,10 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     corp_code = result.get("corp_code", "-")
     bsns_year = result.get("bsns_year", "-")
     summary = result.get("summary", {})
+    cps = result.get("cash_per_share", "N/A")
 
     print(f"{corp_name} ({corp_code}) - 사업연도 {bsns_year}")
+    print(f"1주당 현금: {cps}")
     for label in ("매출액", "영업이익", "당기순이익", "자산총계", "부채총계", "자본총계"):
         print(f"{label}: {summary.get(label, 'N/A')}")
     return 0
@@ -650,6 +753,8 @@ def build_gui():
                 snapshot = client.get_snapshot_with_financials(code)
                 try:
                     dart_data = fetch_dart_financials(user_input)
+                    if dart_data and dart_data.get("cash_per_share"):
+                        snapshot.cash = dart_data.get("cash_per_share")
                 except Exception as exc:
                     dart_error = str(exc)
             except Exception as exc:  # broad catch to show UI errors
@@ -686,7 +791,7 @@ def build_gui():
     add_row("Price", price_var, 2)
     add_row("PER", per_var, 3)
     add_row("PBR", pbr_var, 4)
-    add_row("Cash", cash_var, 5)
+    add_row("1주당 현금", cash_var, 5)
     add_row("Debt ratio", debt_var, 6)
     add_row("사업연도(DART)", dart_year_var, 7)
     add_row("매출액", dart_sales_var, 8)
