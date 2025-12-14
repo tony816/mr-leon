@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import zipfile
+import datetime
 from dataclasses import dataclass
 from functools import lru_cache
 from html import unescape
@@ -25,6 +26,14 @@ DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_MULTI_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttMultiAcnt.json"
 DART_STOCK_TOT_URL = "https://opendart.fss.or.kr/api/stockTotqySttus.json"
 DART_SINGLE_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+
+# (reprt_code, release_month, release_year_offset_from_bsns_year)
+REPORT_SCHEDULE = (
+    ("11014", 11, 0),  # 3분기보고서
+    ("11012", 8, 0),   # 반기/2분기보고서
+    ("11013", 5, 0),   # 1분기보고서
+    ("11011", 3, 1),   # 사업보고서 (다음 해 3월 공시)
+)
 
 
 class KisError(Exception):
@@ -351,22 +360,84 @@ def fetch_dart_stock_totals(corp_code: str, bsns_year: str, reprt_code: str) -> 
     return parse_stock_totals(entries)
 
 
-def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt_code: str = "11011") -> Dict[str, str]:
+def build_report_periods(
+    bsns_year: Optional[str] = None,
+    today: Optional[datetime.date] = None,
+    years_back: int = 4,
+) -> Tuple[Tuple[str, str], ...]:
+    """Return (year, reprt_code) pairs ordered from most recent release backward.
+
+    - Includes 분기/반기/3분기 + 사업보고서.
+    - Skips unreleased periods when bsns_year is not specified (auto mode).
+    """
+    current_date = today or datetime.date.today()
+    candidates = []
+
+    def collect_for_year(year: int, skip_unreleased: bool = True):
+        year_entries = []
+        for code, release_month, year_offset in REPORT_SCHEDULE:
+            release_date = datetime.date(year + year_offset, release_month, 1)
+            if skip_unreleased and release_date > current_date:
+                continue
+            year_entries.append((release_date, str(year), code))
+        return year_entries
+
+    try:
+        year_value = int(bsns_year)
+    except (TypeError, ValueError):
+        current_year = current_date.year
+        current_entries = collect_for_year(current_year, skip_unreleased=True)
+        if current_entries:
+            candidates.extend(current_entries)
+
+        required_prev_years = max(0, years_back)
+        if not current_entries:
+            required_prev_years = max(1, required_prev_years)
+
+        year = current_year - 1
+        max_lookback = current_year - 12
+        added_prev = 0
+        while added_prev < required_prev_years and year > max_lookback:
+            entries = collect_for_year(year, skip_unreleased=True)
+            if entries:
+                candidates.extend(entries)
+                added_prev += 1
+            year -= 1
+    else:
+        candidates.extend(collect_for_year(year_value, skip_unreleased=False))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return tuple((year, code) for _, year, code in candidates)
+
+
+def fetch_dart_financials(
+    user_text: str,
+    bsns_year: Optional[str] = None,
+    reprt_code: Optional[str] = None,
+    fallback_listed_shares: Optional[int] = None,
+) -> Dict[str, str]:
+    """Fetch DART financials prioritizing the most recent available report.
+
+    If reprt_code is omitted, it tries quarters/half/3Q/business report by release
+    recency. Passing reprt_code forces that report type.
+    """
     corp_code, corp_name = resolve_dart_corp(user_text)
     now_year = time.localtime().tm_year
-    years_to_try = []
-    if bsns_year:
-        years_to_try.append(str(bsns_year))
+    if reprt_code:
+        years_to_try = [str(bsns_year)] if bsns_year else [str(now_year - i) for i in range(4)]
+        periods = [(year, reprt_code) for year in years_to_try]
     else:
-        years_to_try.extend([str(now_year), str(now_year - 1), str(now_year - 2), str(now_year - 3)])
+        periods = list(build_report_periods(bsns_year=bsns_year, years_back=4))
+        if not periods:
+            periods = [(str(now_year), "11013")]
 
     last_error = None
-    for year in years_to_try:
+    for year, report_code in periods:
         params = {
             "crtfc_key": get_dart_key(),
             "corp_code": corp_code,
             "bsns_year": year,
-            "reprt_code": reprt_code,
+            "reprt_code": report_code,
         }
         resp = requests.get(DART_MULTI_ACNT_URL, params=params, timeout=15)
         if resp.status_code != 200:
@@ -383,7 +454,7 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
             continue
         single_entries = []
         try:
-            single_entries = fetch_dart_single_accounts(corp_code, year, reprt_code)
+            single_entries = fetch_dart_single_accounts(corp_code, year, report_code)
         except Exception:
             single_entries = []
 
@@ -417,11 +488,19 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
 
         float_shares = None
         try:
-            float_shares = fetch_dart_stock_totals(corp_code, year, reprt_code)
+            float_shares = fetch_dart_stock_totals(corp_code, year, report_code)
         except Exception:
             float_shares = None
 
+        used_kis_fallback = False
+        if float_shares is None and fallback_listed_shares and fallback_listed_shares > 0:
+            float_shares = fallback_listed_shares
+            used_kis_fallback = True
+
         net_cash_per_share = format_per_share(net_cash, float_shares)
+        if used_kis_fallback and net_cash_per_share != "N/A":
+            net_cash_per_share = f"{net_cash_per_share} (KIS 상장주식수)"
+
         net_cash_display = format_amount(net_cash) if net_cash is not None else "N/A"
         float_shares_display = format_amount(float_shares) if float_shares is not None else None
 
@@ -429,7 +508,7 @@ def fetch_dart_financials(user_text: str, bsns_year: Optional[str] = None, reprt
             "corp_name": corp_name,
             "corp_code": corp_code,
             "bsns_year": year,
-            "reprt_code": reprt_code,
+            "reprt_code": report_code,
             "summary": summary,
             "cash_equivalents": format_amount(cash_equivalents) if cash_equivalents is not None else "N/A",
             "liquid_funds": liquid_funds,
@@ -461,6 +540,7 @@ class PriceSnapshot:
     pbr: str
     cash: str = "N/A"
     debt_ratio: str = "N/A"
+    listed_shares: Optional[int] = None
 
 
 class KisClient:
@@ -544,6 +624,7 @@ class KisClient:
         price = output.get("stck_prpr", "")
         per = output.get("per", "")
         pbr = output.get("pbr", "")
+        listed_shares = _parse_int(output.get("lstn_stcn"))
 
         return PriceSnapshot(
             name=name or "N/A",
@@ -551,6 +632,7 @@ class KisClient:
             price=clean_number(price),
             per=per if per != "" else "N/A",
             pbr=pbr if pbr != "" else "N/A",
+            listed_shares=listed_shares,
         )
 
     def _first_in_output(self, payload) -> Dict:
@@ -702,8 +784,27 @@ def run_cli(symbol: Optional[str]) -> int:
 def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     prompt = "회사명을 입력하세요 (예: 삼성전자): "
     user_input = symbol or input(prompt).strip()
+    fallback_listed_shares = None
+
+    # Try KIS to get 상장주식수 for fallback when DART 유통주식수 is missing.
     try:
-        result = fetch_dart_financials(user_input, bsns_year=year)
+        stock_code = resolve_code(user_input)
+        app_key = os.getenv("KIS_APP_KEY")
+        app_secret = os.getenv("KIS_APP_SECRET")
+        base_url = os.getenv("KIS_BASE_URL")
+        if stock_code and app_key and app_secret:
+            kis_client = KisClient(app_key, app_secret, base_url=base_url)
+            price_snapshot = kis_client.get_price_snapshot(stock_code)
+            fallback_listed_shares = price_snapshot.listed_shares
+    except Exception:
+        fallback_listed_shares = None
+
+    try:
+        result = fetch_dart_financials(
+            user_input,
+            bsns_year=year,
+            fallback_listed_shares=fallback_listed_shares,
+        )
     except DartError as exc:
         print(f"DART 조회 실패: {exc}", file=sys.stderr)
         return 1
@@ -865,7 +966,7 @@ def build_gui():
                 snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
 
             try:
-                dart_data = fetch_dart_financials(user_input)
+                dart_data = fetch_dart_financials(user_input, fallback_listed_shares=snapshot.listed_shares)
                 if dart_data and dart_data.get("corp_name"):
                     snapshot.name = dart_data.get("corp_name")
                 if dart_data and dart_data.get("corp_code"):
