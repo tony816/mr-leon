@@ -860,20 +860,14 @@ def build_gui():
     input_var = tk.StringVar()
     status_var = tk.StringVar(value="Set KIS_APP_KEY and KIS_APP_SECRET in .env, then enter a company name.")
     name_var = tk.StringVar(value="-")
-    code_var = tk.StringVar(value="-")
     price_var = tk.StringVar(value="-")
     per_var = tk.StringVar(value="-")
     pbr_var = tk.StringVar(value="-")
-    cash_var = tk.StringVar(value="-")
     debt_var = tk.StringVar(value="-")
     dart_year_var = tk.StringVar(value="-")
     dart_net_cash_ps_var = tk.StringVar(value="-")
-    dart_net_cash_var = tk.StringVar(value="-")
     dart_sales_var = tk.StringVar(value="-")
     dart_op_var = tk.StringVar(value="-")
-    dart_net_var = tk.StringVar(value="-")
-    dart_asset_var = tk.StringVar(value="-")
-    dart_debt_var = tk.StringVar(value="-")
     dart_equity_var = tk.StringVar(value="-")
 
     def set_status(text: str):
@@ -888,7 +882,6 @@ def build_gui():
                 0,
                 lambda: (
                     name_var.set(snapshot.name),
-                    code_var.set(snapshot.code),
                     price_var.set(snapshot.price),
                     per_var.set(snapshot.per),
                     pbr_var.set(snapshot.pbr),
@@ -905,14 +898,9 @@ def build_gui():
                     0,
                     lambda: (
                         dart_year_var.set(dart_data.get("bsns_year", "-")),
-                        cash_var.set(liquid_display),
                         dart_net_cash_ps_var.set(dart_data.get("net_cash_per_share", "N/A")),
-                        dart_net_cash_var.set(dart_data.get("net_cash_display", "N/A")),
                         dart_sales_var.set(summary.get("매출액", "N/A")),
                         dart_op_var.set(summary.get("영업이익", "N/A")),
-                        dart_net_var.set(summary.get("당기순이익", "N/A")),
-                        dart_asset_var.set(summary.get("자산총계", "N/A")),
-                        dart_debt_var.set(summary.get("부채총계", "N/A")),
                         dart_equity_var.set(summary.get("자본총계", "N/A")),
                     ),
                 )
@@ -921,14 +909,9 @@ def build_gui():
                     0,
                     lambda: (
                         dart_year_var.set("-"),
-                        cash_var.set("-"),
                         dart_net_cash_ps_var.set("-"),
-                        dart_net_cash_var.set("-"),
                         dart_sales_var.set("-"),
                         dart_op_var.set("-"),
-                        dart_net_var.set("-"),
-                        dart_asset_var.set("-"),
-                        dart_debt_var.set("-"),
                         dart_equity_var.set("-"),
                     ),
                 )
@@ -999,21 +982,15 @@ def build_gui():
         ttk.Label(info_frame, textvariable=var, width=32).grid(row=row_idx, column=1, sticky="w", pady=2)
 
     add_row("Name", name_var, 0)
-    add_row("Code", code_var, 1)
-    add_row("Price", price_var, 2)
-    add_row("PER", per_var, 3)
-    add_row("PBR", pbr_var, 4)
-    add_row("현금성자산(DART)", cash_var, 5)
-    add_row("Debt ratio", debt_var, 6)
-    add_row("사업연도(DART)", dart_year_var, 7)
-    add_row("주당 순현금", dart_net_cash_ps_var, 8)
-    add_row("순현금", dart_net_cash_var, 9)
-    add_row("매출액", dart_sales_var, 10)
-    add_row("영업이익", dart_op_var, 11)
-    add_row("당기순이익", dart_net_var, 12)
-    add_row("자산총계", dart_asset_var, 13)
-    add_row("부채총계", dart_debt_var, 14)
-    add_row("자본총계", dart_equity_var, 15)
+    add_row("Price", price_var, 1)
+    add_row("PER", per_var, 2)
+    add_row("PBR", pbr_var, 3)
+    add_row("Debt ratio", debt_var, 4)
+    add_row("사업연도(DART)", dart_year_var, 5)
+    add_row("주당 순현금", dart_net_cash_ps_var, 6)
+    add_row("매출액", dart_sales_var, 7)
+    add_row("영업이익", dart_op_var, 8)
+    add_row("자본총계", dart_equity_var, 9)
 
     status_bar = ttk.Label(root, textvariable=status_var, anchor="w", relief="sunken")
     status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
