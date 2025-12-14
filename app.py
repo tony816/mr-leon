@@ -415,6 +415,7 @@ def fetch_dart_financials(
     bsns_year: Optional[str] = None,
     reprt_code: Optional[str] = None,
     fallback_listed_shares: Optional[int] = None,
+    market_price: Optional[float] = None,
 ) -> Dict[str, str]:
     """Fetch DART financials prioritizing the most recent available report.
 
@@ -497,9 +498,24 @@ def fetch_dart_financials(
             float_shares = fallback_listed_shares
             used_kis_fallback = True
 
+        net_cash_per_share_value = None
+        if net_cash is not None and float_shares:
+            try:
+                net_cash_per_share_value = net_cash / float_shares
+            except Exception:
+                net_cash_per_share_value = None
+
         net_cash_per_share = format_per_share(net_cash, float_shares)
         if used_kis_fallback and net_cash_per_share != "N/A":
             net_cash_per_share = f"{net_cash_per_share} (KIS 상장주식수)"
+
+        net_cash_per_share_ratio = "N/A"
+        if net_cash_per_share_value is not None and market_price and market_price > 0:
+            try:
+                ratio = (net_cash_per_share_value / market_price) * 100
+                net_cash_per_share_ratio = f"{ratio:,.2f}%"
+            except Exception:
+                net_cash_per_share_ratio = "N/A"
 
         net_cash_display = format_amount(net_cash) if net_cash is not None else "N/A"
         float_shares_display = format_amount(float_shares) if float_shares is not None else None
@@ -518,6 +534,7 @@ def fetch_dart_financials(
             "float_shares": float_shares,
             "float_shares_display": float_shares_display,
             "net_cash_per_share": net_cash_per_share,
+            "net_cash_per_share_ratio": net_cash_per_share_ratio,
         }
 
     raise DartError(last_error or "조회 가능한 연도가 없습니다.")
@@ -785,6 +802,7 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     prompt = "회사명을 입력하세요 (예: 삼성전자): "
     user_input = symbol or input(prompt).strip()
     fallback_listed_shares = None
+    market_price = None
 
     # Try KIS to get 상장주식수 for fallback when DART 유통주식수 is missing.
     try:
@@ -796,6 +814,7 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
             kis_client = KisClient(app_key, app_secret, base_url=base_url)
             price_snapshot = kis_client.get_price_snapshot(stock_code)
             fallback_listed_shares = price_snapshot.listed_shares
+            market_price = parse_amount(price_snapshot.price)
     except Exception:
         fallback_listed_shares = None
 
@@ -804,6 +823,7 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
             user_input,
             bsns_year=year,
             fallback_listed_shares=fallback_listed_shares,
+            market_price=market_price,
         )
     except DartError as exc:
         print(f"DART 조회 실패: {exc}", file=sys.stderr)
@@ -814,10 +834,12 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     bsns_year = result.get("bsns_year", "-")
     summary = result.get("summary", {})
     ncs = result.get("net_cash_per_share", "N/A")
+    ncs_ratio = result.get("net_cash_per_share_ratio", "N/A")
     net_cash_display = result.get("net_cash_display", "N/A")
 
     print(f"{corp_name} ({corp_code}) - 사업연도 {bsns_year}")
     print(f"주당 순현금: {ncs}")
+    print(f"주당 순현금/주가: {ncs_ratio}")
     print(f"순현금(총액): {net_cash_display}")
     for label in ("매출액", "영업이익", "당기순이익", "자산총계", "부채총계", "자본총계"):
         print(f"{label}: {summary.get(label, 'N/A')}")
@@ -866,6 +888,7 @@ def build_gui():
     debt_var = tk.StringVar(value="-")
     dart_year_var = tk.StringVar(value="-")
     dart_net_cash_ps_var = tk.StringVar(value="-")
+    dart_net_cash_ps_ratio_var = tk.StringVar(value="-")
     dart_sales_var = tk.StringVar(value="-")
     dart_op_var = tk.StringVar(value="-")
     dart_equity_var = tk.StringVar(value="-")
@@ -893,12 +916,12 @@ def build_gui():
         try:
             if dart_data:
                 summary = dart_data.get("summary", {}) if isinstance(dart_data, dict) else {}
-                liquid_display = format_amount(dart_data.get("liquid_funds"))
                 root.after(
                     0,
                     lambda: (
                         dart_year_var.set(dart_data.get("bsns_year", "-")),
                         dart_net_cash_ps_var.set(dart_data.get("net_cash_per_share", "N/A")),
+                        dart_net_cash_ps_ratio_var.set(dart_data.get("net_cash_per_share_ratio", "N/A")),
                         dart_sales_var.set(summary.get("매출액", "N/A")),
                         dart_op_var.set(summary.get("영업이익", "N/A")),
                         dart_equity_var.set(summary.get("자본총계", "N/A")),
@@ -910,6 +933,7 @@ def build_gui():
                     lambda: (
                         dart_year_var.set("-"),
                         dart_net_cash_ps_var.set("-"),
+                        dart_net_cash_ps_ratio_var.set("-"),
                         dart_sales_var.set("-"),
                         dart_op_var.set("-"),
                         dart_equity_var.set("-"),
@@ -948,8 +972,14 @@ def build_gui():
                 set_status("KIS 실패, DART만 표시")
                 snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
 
+            market_price = parse_amount(snapshot.price)
+
             try:
-                dart_data = fetch_dart_financials(user_input, fallback_listed_shares=snapshot.listed_shares)
+                dart_data = fetch_dart_financials(
+                    user_input,
+                    fallback_listed_shares=snapshot.listed_shares,
+                    market_price=market_price,
+                )
                 if dart_data and dart_data.get("corp_name"):
                     snapshot.name = dart_data.get("corp_name")
                 if dart_data and dart_data.get("corp_code"):
@@ -988,9 +1018,10 @@ def build_gui():
     add_row("Debt ratio", debt_var, 4)
     add_row("사업연도(DART)", dart_year_var, 5)
     add_row("주당 순현금", dart_net_cash_ps_var, 6)
-    add_row("매출액", dart_sales_var, 7)
-    add_row("영업이익", dart_op_var, 8)
-    add_row("자본총계", dart_equity_var, 9)
+    add_row("주당 순현금/주가", dart_net_cash_ps_ratio_var, 7)
+    add_row("매출액", dart_sales_var, 8)
+    add_row("영업이익", dart_op_var, 9)
+    add_row("자본총계", dart_equity_var, 10)
 
     status_bar = ttk.Label(root, textvariable=status_var, anchor="w", relief="sunken")
     status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
