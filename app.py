@@ -224,6 +224,20 @@ def parse_amount(value) -> Optional[int]:
         return None
 
 
+def parse_float(value) -> Optional[float]:
+    if value in (None, "", "-", "NaN"):
+        return None
+    text = str(value).strip().replace(",", "").replace("%", "")
+    if not text:
+        return None
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def format_amount(value) -> str:
     amount = parse_amount(value)
     if amount is None:
@@ -235,6 +249,18 @@ def format_per_share(cash_value: Optional[int], shares: Optional[int]) -> str:
     if cash_value is None or shares is None or shares <= 0:
         return "N/A"
     return f"{cash_value / shares:,.2f}"
+
+
+def in_range(value: Optional[float], min_value: Optional[float], max_value: Optional[float]) -> bool:
+    """Return True if value is within [min, max] when bounds are provided."""
+    if value is None:
+        # If bounds exist but value is missing, treat as not matching.
+        return not (min_value or max_value)
+    if min_value is not None and value < min_value:
+        return False
+    if max_value is not None and value > max_value:
+        return False
+    return True
 
 
 def find_account_amount(entries, target_key: str) -> Optional[int]:
@@ -558,6 +584,7 @@ class PriceSnapshot:
     cash: str = "N/A"
     debt_ratio: str = "N/A"
     listed_shares: Optional[int] = None
+    net_cash_per_share_ratio: Optional[str] = None
 
 
 class KisClient:
@@ -642,6 +669,7 @@ class KisClient:
         per = output.get("per", "")
         pbr = output.get("pbr", "")
         listed_shares = _parse_int(output.get("lstn_stcn"))
+        net_cash_ratio = None
 
         return PriceSnapshot(
             name=name or "N/A",
@@ -650,6 +678,7 @@ class KisClient:
             per=per if per != "" else "N/A",
             pbr=pbr if pbr != "" else "N/A",
             listed_shares=listed_shares,
+            net_cash_per_share_ratio=net_cash_ratio,
         )
 
     def _first_in_output(self, payload) -> Dict:
@@ -869,7 +898,7 @@ def build_gui():
 
     root = tk.Tk()
     root.title("KIS + DART Viewer")
-    root.geometry("540x430")
+    root.geometry("640x430")
     root.resizable(False, False)
 
     root.configure(padx=14, pady=12, bg="#f7f7f7")
@@ -892,6 +921,157 @@ def build_gui():
     dart_sales_var = tk.StringVar(value="-")
     dart_op_var = tk.StringVar(value="-")
     dart_equity_var = tk.StringVar(value="-")
+
+    def open_scan_modal():
+        modal = tk.Toplevel(root)
+        modal.title("Range Scan")
+        modal.geometry("720x520")
+        modal.resizable(True, True)
+
+        per_min_var = tk.StringVar()
+        per_max_var = tk.StringVar()
+        pbr_min_var = tk.StringVar()
+        pbr_max_var = tk.StringVar()
+        debt_min_var = tk.StringVar()
+        debt_max_var = tk.StringVar()
+        ncs_ratio_min_var = tk.StringVar()
+        ncs_ratio_max_var = tk.StringVar()
+        scan_status_var = tk.StringVar(value="범위를 입력 후 Scan을 눌러주세요.")
+
+        controls = ttk.Frame(modal, padding=(8, 8))
+        controls.pack(fill="x")
+
+        def add_field(row, label, min_var, max_var):
+            ttk.Label(controls, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(controls, textvariable=min_var, width=10).grid(row=row, column=1, sticky="w", padx=(4, 8))
+            ttk.Label(controls, text="~").grid(row=row, column=2, sticky="w")
+            ttk.Entry(controls, textvariable=max_var, width=10).grid(row=row, column=3, sticky="w", padx=(4, 12))
+
+        add_field(0, "PER", per_min_var, per_max_var)
+        add_field(1, "PBR", pbr_min_var, pbr_max_var)
+        add_field(2, "부채비율", debt_min_var, debt_max_var)
+        add_field(3, "주당 순현금/주가(%)", ncs_ratio_min_var, ncs_ratio_max_var)
+
+        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=4, rowspan=2, padx=4)
+        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=2, column=4, rowspan=2, padx=4)
+
+        columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio")
+        tree = ttk.Treeview(modal, columns=columns, show="headings", height=16)
+        for col, text, width in (
+            ("name", "Name", 180),
+            ("code", "Code", 80),
+            ("per", "PER", 80),
+            ("pbr", "PBR", 80),
+            ("debt", "부채비율", 100),
+            ("net_cash_ratio", "주당순현금/주가", 140),
+        ):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="center")
+        tree.pack(fill="both", expand=True, padx=8, pady=(4, 2))
+
+        scrollbar = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        ttk.Label(modal, textvariable=scan_status_var, anchor="w").pack(fill="x", padx=8, pady=(0, 6))
+
+        def start_scan():
+            try:
+                per_min = parse_float(per_min_var.get())
+                per_max = parse_float(per_max_var.get())
+                pbr_min = parse_float(pbr_min_var.get())
+                pbr_max = parse_float(pbr_max_var.get())
+                debt_min = parse_float(debt_min_var.get())
+                debt_max = parse_float(debt_max_var.get())
+                ncsr_min = parse_float(ncs_ratio_min_var.get())
+                ncsr_max = parse_float(ncs_ratio_max_var.get())
+            except Exception:
+                scan_status_var.set("입력 파싱 오류")
+                return
+
+            for item in tree.get_children():
+                tree.delete(item)
+            scan_status_var.set("Preparing scan...")
+
+            def worker():
+                def set_scan_status(text: str):
+                    try:
+                        root.after(0, lambda: scan_status_var.set(text))
+                    except Exception:
+                        pass
+
+                try:
+                    app_key = os.getenv("KIS_APP_KEY")
+                    app_secret = os.getenv("KIS_APP_SECRET")
+                    base_url = os.getenv("KIS_BASE_URL")
+                    if not app_key or not app_secret:
+                        set_scan_status("KIS 키를 설정하세요.")
+                        return
+
+                    set_scan_status("KRX/DART 목록 불러오는 중...")
+                    kis_client = KisClient(app_key, app_secret, base_url=base_url)
+                    _, stock_map, code_to_name = load_dart_corp_map()
+                    krx_codes = set(load_name_map().values())
+                    targets = [(code, corp_code) for code, corp_code in stock_map.items() if code in krx_codes]
+                    if not targets:
+                        set_scan_status("대상 종목이 없습니다 (KRX 필터 이후 비어 있음)")
+                        return
+
+                    total = len(targets)
+                    matched = 0
+                    processed = 0
+                    last_error = None
+
+                    set_scan_status(f"Scanning... 0/{total}")
+                    for stock_code, corp_code in targets:
+                        processed += 1
+                        try:
+                            snapshot = kis_client.get_snapshot_with_financials(stock_code)
+                            price_val = parse_amount(snapshot.price)
+                            per_val = parse_float(snapshot.per)
+                            pbr_val = parse_float(snapshot.pbr)
+                            debt_val = parse_float(snapshot.debt_ratio)
+
+                            dart_data = fetch_dart_financials(
+                                corp_code,
+                                fallback_listed_shares=snapshot.listed_shares,
+                                market_price=price_val,
+                            )
+                            ncs_ratio_text = dart_data.get("net_cash_per_share_ratio", "N/A")
+                            ncs_ratio_val = parse_float(ncs_ratio_text)
+
+                            if not (
+                                in_range(per_val, per_min, per_max)
+                                and in_range(pbr_val, pbr_min, pbr_max)
+                                and in_range(debt_val, debt_min, debt_max)
+                                and in_range(ncs_ratio_val, ncsr_min, ncsr_max)
+                            ):
+                                continue
+
+                            matched += 1
+                            name = code_to_name.get(corp_code, snapshot.name or "N/A")
+                            values = (
+                                name,
+                                stock_code,
+                                snapshot.per,
+                                snapshot.pbr,
+                                snapshot.debt_ratio,
+                                ncs_ratio_text,
+                            )
+                            root.after(0, lambda vals=values: tree.insert("", "end", values=vals))
+                        except Exception as exc:
+                            last_error = str(exc)
+                        if processed % 10 == 0 or processed == total:
+                            set_scan_status(f"Scanning... {processed}/{total}, matched {matched}")
+
+                    if last_error:
+                        set_scan_status(f"완료: {matched}개 매치 / {total}개 처리 (마지막 오류: {last_error})")
+                    else:
+                        set_scan_status(f"완료: {matched}개 매치 / {total}개 처리")
+                except Exception as exc:
+                    set_scan_status(f"오류: {exc}")
+
+            threading.Thread(target=worker, daemon=True).start()
 
     def set_status(text: str):
         try:
@@ -1000,8 +1180,11 @@ def build_gui():
     entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
     entry.focus()
     ttk.Button(root, text="Lookup", command=do_fetch).grid(row=1, column=1, sticky="ew")
+    ttk.Button(root, text="Range Scan", command=open_scan_modal).grid(row=1, column=2, sticky="ew", padx=(8, 0))
 
     root.grid_columnconfigure(0, weight=1)
+    root.grid_columnconfigure(1, weight=0)
+    root.grid_columnconfigure(2, weight=0)
 
     info_frame = ttk.Frame(root)
     info_frame.grid(row=2, column=0, columnspan=2, pady=(12, 8), sticky="ew")
