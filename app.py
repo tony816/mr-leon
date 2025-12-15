@@ -29,6 +29,7 @@ DART_SINGLE_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+STOOQ_QUOTE_URL = "https://stooq.pl/q/l/"
 SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
@@ -202,6 +203,10 @@ def load_edgar_ticker_map() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
     """Load SEC ticker -> CIK mapping and a normalized name index."""
     resp = requests.get(SEC_TICKERS_URL, headers=sec_headers(), timeout=15)
     if resp.status_code != 200:
+        if resp.status_code == 403:
+            raise EdgarError(
+                "Failed to load SEC ticker list: HTTP 403. Register a contact info User-Agent via SEC_USER_AGENT or EDGAR_USER_AGENT environment variable."
+            )
         raise EdgarError(f"Failed to load SEC ticker list: HTTP {resp.status_code}")
     try:
         data = resp.json()
@@ -704,22 +709,56 @@ def _extract_latest_fact(
 
 
 def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
-    resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": ticker}, timeout=10)
-    if resp.status_code != 200:
-        raise EdgarError(f"Quote request failed: HTTP {resp.status_code}")
+    last_error = None
     try:
-        result = resp.json().get("quoteResponse", {}).get("result", [])
-    except Exception as exc:
-        raise EdgarError(f"Invalid quote response: {exc}") from exc
+        resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": ticker}, timeout=10)
+        if resp.status_code != 200:
+            raise EdgarError(f"Quote request failed: HTTP {resp.status_code}")
+        try:
+            result = resp.json().get("quoteResponse", {}).get("result", [])
+        except Exception as exc:
+            raise EdgarError(f"Invalid quote response: {exc}") from exc
 
-    if not result:
-        raise EdgarError("Quote not found for ticker.")
-    entry = result[0]
+        if not result:
+            raise EdgarError("Quote not found for ticker.")
+        entry = result[0]
+        return {
+            "price": entry.get("regularMarketPrice"),
+            "per": entry.get("trailingPE"),
+            "pbr": entry.get("priceToBook"),
+            "currency": entry.get("currency"),
+            "source": "yahoo",
+        }
+    except Exception as exc:
+        last_error = str(exc)
+
+    return fetch_stooq_quote(ticker, last_error)
+
+
+def fetch_stooq_quote(ticker: str, yahoo_error: Optional[str] = None) -> Dict[str, Optional[float]]:
+    symbol = f"{ticker.lower()}.us"
+    resp = requests.get(STOOQ_QUOTE_URL, params={"s": symbol, "i": "d"}, timeout=10)
+    if resp.status_code != 200:
+        raise EdgarError(
+            f"Quote request failed (Stooq fallback HTTP {resp.status_code}) after Yahoo error: {yahoo_error or 'N/A'}"
+        )
+    lines = resp.text.strip().splitlines()
+    if not lines or "," not in lines[0]:
+        raise EdgarError("Quote not found for ticker (Stooq fallback).")
+    parts = lines[0].split(",")
+    if len(parts) < 7:
+        raise EdgarError("Unexpected Stooq quote format.")
+    try:
+        close_price = float(parts[6])
+    except Exception:
+        raise EdgarError("Invalid close price from Stooq.")
+
     return {
-        "price": entry.get("regularMarketPrice"),
-        "per": entry.get("trailingPE"),
-        "pbr": entry.get("priceToBook"),
-        "currency": entry.get("currency"),
+        "price": close_price,
+        "per": None,
+        "pbr": None,
+        "currency": "USD",
+        "source": "stooq",
     }
 
 
@@ -961,21 +1000,47 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
 
     revenue = _parse_int(_extract_latest_fact(facts, "Revenues") or _extract_latest_fact(facts, "SalesRevenueNet"))
     op_income = _parse_int(_extract_latest_fact(facts, "OperatingIncomeLoss"))
+    net_income = _parse_int(_extract_latest_fact(facts, "NetIncomeLoss"))
     equity = _parse_int(
         _extract_latest_fact(facts, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
         or _extract_latest_fact(facts, "StockholdersEquity")
     )
 
     quote = {}
+    quote_error = None
     try:
         quote = fetch_yahoo_quote(ticker)
-    except Exception:
+    except Exception as exc:
+        quote_error = str(exc)
         quote = {}
 
     price_val = quote.get("price")
     per_val = quote.get("per")
     pbr_val = quote.get("pbr")
+    quote_source = quote.get("source")
+
     market_price = float(price_val) if price_val is not None else None
+    market_cap = market_price * shares if market_price is not None and shares else None
+
+    # Compute PER/PBR from EDGAR fundamentals when quote source lacks ratios.
+    if per_val is None and market_cap is not None and net_income not in (None, 0):
+        try:
+            per_val = market_cap / net_income
+        except Exception:
+            per_val = None
+    if pbr_val is None and market_cap is not None and equity not in (None, 0):
+        try:
+            pbr_val = market_cap / equity
+        except Exception:
+            pbr_val = None
+
+    debt_ratio_pct = None
+    if debt_value is not None and equity not in (None, 0):
+        try:
+            debt_ratio_pct = (debt_value / equity) * 100
+        except Exception:
+            debt_ratio_pct = None
+    debt_ratio_text = f"{debt_ratio_pct:,.2f}" if debt_ratio_pct is not None else "N/A"
 
     net_cash_per_share_value = None
     if net_cash is not None and shares:
@@ -1000,7 +1065,7 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         per=clean_number(per_val) if per_val is not None else "N/A",
         pbr=clean_number(pbr_val) if pbr_val is not None else "N/A",
         cash=format_amount(liquid_funds) if liquid_funds is not None else "N/A",
-        debt_ratio="N/A",
+        debt_ratio=debt_ratio_text,
         listed_shares=shares,
         net_cash_per_share_ratio=net_cash_per_share_ratio,
     )
@@ -1025,6 +1090,9 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "float_shares_display": format_amount(shares) if shares is not None else None,
         "net_cash_per_share": net_cash_per_share,
         "net_cash_per_share_ratio": net_cash_per_share_ratio,
+        "quote_source": quote_source,
+        "quote_error": quote_error,
+        "debt_ratio": debt_ratio_text,
     }
 
     return snapshot, detail
