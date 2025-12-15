@@ -26,6 +26,10 @@ DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_MULTI_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttMultiAcnt.json"
 DART_STOCK_TOT_URL = "https://opendart.fss.or.kr/api/stockTotqySttus.json"
 DART_SINGLE_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
 REPORT_SCHEDULE = (
@@ -42,6 +46,10 @@ class KisError(Exception):
 
 class DartError(Exception):
     """Raised when the OpenDART API returns an error."""
+
+
+class EdgarError(Exception):
+    """Raised when EDGAR data fetch fails."""
 
 
 def normalize_name(text: str) -> str:
@@ -173,6 +181,80 @@ def resolve_dart_corp(user_text: str) -> Tuple[str, str]:
             return corp_code, code_to_name.get(corp_code, trimmed)
 
     raise DartError("회사명을 찾을 수 없습니다. 정식명 또는 상장사 명칭을 입력하세요.")
+
+
+def _pad_cik(value: str) -> str:
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return digits.zfill(10) if digits else ""
+
+
+def sec_headers() -> Dict[str, str]:
+    ua = os.getenv("SEC_USER_AGENT") or os.getenv("EDGAR_USER_AGENT") or "mr-leon-app/0.1"
+    return {
+        "User-Agent": ua,
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
+@lru_cache(maxsize=1)
+def load_edgar_ticker_map() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+    """Load SEC ticker -> CIK mapping and a normalized name index."""
+    resp = requests.get(SEC_TICKERS_URL, headers=sec_headers(), timeout=15)
+    if resp.status_code != 200:
+        raise EdgarError(f"Failed to load SEC ticker list: HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise EdgarError(f"Invalid SEC ticker list response: {exc}") from exc
+
+    ticker_map: Dict[str, Dict[str, str]] = {}
+    name_index: Dict[str, str] = {}
+    items = data.values() if isinstance(data, dict) else []
+    for item in items:
+        ticker = str(item.get("ticker") or "").upper().strip()
+        cik = _pad_cik(item.get("cik_str") or item.get("cik") or "")
+        title = (item.get("title") or "").strip()
+        if not ticker or not cik:
+            continue
+        ticker_map[ticker] = {"cik": cik, "title": title}
+        if title:
+            name_index[normalize_name(title)] = ticker
+
+    if not ticker_map:
+        raise EdgarError("SEC ticker list is empty.")
+    return ticker_map, name_index
+
+
+def resolve_edgar_company(user_text: str) -> Dict[str, str]:
+    """Resolve user input to ticker/CIK/company name using SEC ticker list."""
+    if not user_text:
+        raise EdgarError("Enter a ticker, CIK, or company name.")
+
+    text = user_text.strip()
+    ticker_map, name_index = load_edgar_ticker_map()
+
+    cleaned_ticker = re.sub(r"[^A-Za-z0-9\.-]", "", text).upper()
+    if cleaned_ticker:
+        info = ticker_map.get(cleaned_ticker)
+        if info:
+            return {"ticker": cleaned_ticker, "cik": info["cik"], "name": info.get("title") or cleaned_ticker}
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        cik = _pad_cik(digits)
+        for ticker, info in ticker_map.items():
+            if info.get("cik") == cik:
+                return {"ticker": ticker, "cik": cik, "name": info.get("title") or ticker}
+        return {"ticker": cleaned_ticker or digits, "cik": cik, "name": text}
+
+    norm_name = normalize_name(text)
+    for name_norm, ticker in name_index.items():
+        if norm_name == name_norm or norm_name in name_norm or name_norm in norm_name:
+            info = ticker_map.get(ticker, {})
+            return {"ticker": ticker, "cik": info.get("cik", ""), "name": info.get("title") or ticker}
+
+    raise EdgarError("Company not found in SEC ticker list.")
 
 
 ACCOUNT_SYNONYMS = {
@@ -567,6 +649,80 @@ def fetch_dart_financials(
 
 
 
+@lru_cache(maxsize=128)
+def load_company_facts(cik: str) -> Dict:
+    cik_padded = _pad_cik(cik)
+    if not cik_padded:
+        raise EdgarError("CIK is required for EDGAR lookup.")
+
+    resp = requests.get(SEC_FACTS_URL.format(cik=cik_padded), headers=sec_headers(), timeout=15)
+    if resp.status_code != 200:
+        raise EdgarError(f"Failed to fetch company facts: HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except Exception as exc:
+        raise EdgarError(f"Invalid company facts payload: {exc}") from exc
+
+
+def _parse_iso_date(date_text: str) -> int:
+    try:
+        return datetime.date.fromisoformat(date_text).toordinal()
+    except Exception:
+        return 0
+
+
+def _extract_latest_fact(
+    facts: Dict,
+    key: str,
+    units=("USD",),
+    forms_priority=SEC_FORM_PRIORITY,
+) -> Optional[float]:
+    facts_root = (facts or {}).get("facts", {}).get("us-gaap", {})
+    entry = facts_root.get(key) or {}
+    unit_map = entry.get("units") or {}
+    candidates = []
+    priority_map = {form: idx for idx, form in enumerate(forms_priority)}
+
+    for unit in units:
+        for item in unit_map.get(unit, []):
+            val = item.get("val")
+            if val in (None, "", "-", "NaN"):
+                continue
+            try:
+                val_num = float(val)
+            except Exception:
+                continue
+            form = item.get("form", "")
+            priority = priority_map.get(form, len(forms_priority))
+            end_ts = _parse_iso_date(item.get("end") or "") or _parse_iso_date(item.get("filed") or "")
+            candidates.append((priority, end_ts, val_num))
+
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda c: (c[0], -c[1]))
+    return best[2]
+
+
+def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
+    resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": ticker}, timeout=10)
+    if resp.status_code != 200:
+        raise EdgarError(f"Quote request failed: HTTP {resp.status_code}")
+    try:
+        result = resp.json().get("quoteResponse", {}).get("result", [])
+    except Exception as exc:
+        raise EdgarError(f"Invalid quote response: {exc}") from exc
+
+    if not result:
+        raise EdgarError("Quote not found for ticker.")
+    entry = result[0]
+    return {
+        "price": entry.get("regularMarketPrice"),
+        "per": entry.get("trailingPE"),
+        "pbr": entry.get("priceToBook"),
+        "currency": entry.get("currency"),
+    }
+
+
 def clean_number(val: str) -> str:
     try:
         return f"{float(val):,}"
@@ -776,6 +932,104 @@ class KisClient:
         return snapshot
 
 
+def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str]]:
+    company = resolve_edgar_company(user_text)
+    ticker = company.get("ticker") or user_text
+    cik = company.get("cik") or ""
+    name = company.get("name") or ticker
+
+    facts = load_company_facts(cik)
+    cash_val = _parse_int(_extract_latest_fact(facts, "CashAndCashEquivalentsAtCarryingValue"))
+    short_inv = _parse_int(
+        _extract_latest_fact(facts, "MarketableSecuritiesCurrent")
+        or _extract_latest_fact(facts, "ShortTermInvestments")
+    )
+    liquid_funds = _sum_or_none([cash_val, short_inv])
+
+    debt_current = _parse_int(
+        _extract_latest_fact(facts, "DebtCurrent")
+        or _extract_latest_fact(facts, "LongTermDebtCurrent")
+    )
+    debt_noncurrent = _parse_int(
+        _extract_latest_fact(facts, "LongTermDebt")
+        or _extract_latest_fact(facts, "LongTermDebtNoncurrent")
+    )
+    total_debt = _sum_or_none([debt_current, debt_noncurrent])
+    net_cash, debt_value = compute_net_cash(liquid_funds, total_debt)
+
+    shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
+
+    revenue = _parse_int(_extract_latest_fact(facts, "Revenues") or _extract_latest_fact(facts, "SalesRevenueNet"))
+    op_income = _parse_int(_extract_latest_fact(facts, "OperatingIncomeLoss"))
+    equity = _parse_int(
+        _extract_latest_fact(facts, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
+        or _extract_latest_fact(facts, "StockholdersEquity")
+    )
+
+    quote = {}
+    try:
+        quote = fetch_yahoo_quote(ticker)
+    except Exception:
+        quote = {}
+
+    price_val = quote.get("price")
+    per_val = quote.get("per")
+    pbr_val = quote.get("pbr")
+    market_price = float(price_val) if price_val is not None else None
+
+    net_cash_per_share_value = None
+    if net_cash is not None and shares:
+        try:
+            net_cash_per_share_value = net_cash / shares
+        except Exception:
+            net_cash_per_share_value = None
+
+    net_cash_per_share = format_per_share(net_cash, shares)
+    net_cash_per_share_ratio = "N/A"
+    if net_cash_per_share_value is not None and market_price and market_price > 0:
+        try:
+            ratio = (net_cash_per_share_value / market_price) * 100
+            net_cash_per_share_ratio = f"{ratio:,.2f}%"
+        except Exception:
+            net_cash_per_share_ratio = "N/A"
+
+    snapshot = PriceSnapshot(
+        name=name,
+        code=ticker,
+        price=clean_number(price_val) if price_val is not None else "N/A",
+        per=clean_number(per_val) if per_val is not None else "N/A",
+        pbr=clean_number(pbr_val) if pbr_val is not None else "N/A",
+        cash=format_amount(liquid_funds) if liquid_funds is not None else "N/A",
+        debt_ratio="N/A",
+        listed_shares=shares,
+        net_cash_per_share_ratio=net_cash_per_share_ratio,
+    )
+
+    detail_summary = {
+        "매출액": format_amount(revenue) if revenue is not None else "N/A",
+        "영업이익": format_amount(op_income) if op_income is not None else "N/A",
+        "자본총계": format_amount(equity) if equity is not None else "N/A",
+    }
+
+    detail = {
+        "corp_name": name,
+        "corp_code": ticker,
+        "cik": cik,
+        "bsns_year": "-",  # EDGAR facts API is period-agnostic; surface aggregate only.
+        "summary": detail_summary,
+        "liquid_funds": liquid_funds,
+        "interest_bearing_debt": debt_value,
+        "net_cash": net_cash,
+        "net_cash_display": format_amount(net_cash) if net_cash is not None else "N/A",
+        "float_shares": shares,
+        "float_shares_display": format_amount(shares) if shares is not None else None,
+        "net_cash_per_share": net_cash_per_share,
+        "net_cash_per_share_ratio": net_cash_per_share_ratio,
+    }
+
+    return snapshot, detail
+
+
 def resolve_code(user_text: str) -> Optional[str]:
     if not user_text:
         return None
@@ -897,7 +1151,7 @@ def build_gui():
     from tkinter import ttk, messagebox
 
     root = tk.Tk()
-    root.title("KIS + DART Viewer")
+    root.title("KIS/DART/EDGAR Viewer")
     root.geometry("640x430")
     root.resizable(False, False)
 
@@ -908,8 +1162,11 @@ def build_gui():
         style.configure(widget, font=("Segoe UI", 10))
     style.configure("TButton", padding=6)
 
+    country_var = tk.StringVar(value="US")
     input_var = tk.StringVar()
-    status_var = tk.StringVar(value="Set KIS_APP_KEY and KIS_APP_SECRET in .env, then enter a company name.")
+    status_var = tk.StringVar(
+        value="Select a country, then enter a company. KR requires KIS/DART keys; US uses EDGAR."
+    )
     name_var = tk.StringVar(value="-")
     price_var = tk.StringVar(value="-")
     per_var = tk.StringVar(value="-")
@@ -923,6 +1180,9 @@ def build_gui():
     dart_equity_var = tk.StringVar(value="-")
 
     def open_scan_modal():
+        if country_var.get() != "KR":
+            messagebox.showinfo("Range Scan", "Range Scan is available for Korea (KR) only.")
+            return
         modal = tk.Toplevel(root)
         modal.title("Range Scan")
         modal.geometry("720x520")
@@ -1123,64 +1383,100 @@ def build_gui():
             pass
 
     def do_fetch():
-        user_input = input_var.get()
-        try:
-            code = resolve_code(user_input)
-        except KisError as exc:
-            messagebox.showerror("Name lookup failed", str(exc))
+        user_input = input_var.get().strip()
+        selected_country = country_var.get()
+
+        if not user_input:
+            messagebox.showerror("Input error", "Enter a ticker or company name.")
             return
 
-        if not code:
-            messagebox.showerror("Input error", "Enter a valid company name or 6-digit code.")
-            return
+        if selected_country == "KR":
+            try:
+                code = resolve_code(user_input)
+            except KisError as exc:
+                messagebox.showerror("Name lookup failed", str(exc))
+                return
 
-        app_key = os.getenv("KIS_APP_KEY")
-        app_secret = os.getenv("KIS_APP_SECRET")
-        base_url = os.getenv("KIS_BASE_URL")
-        kis_enabled = bool(app_key and app_secret)
-        client = KisClient(app_key, app_secret, base_url=base_url) if kis_enabled else None
+            if not code:
+                messagebox.showerror("Input error", "Enter a valid company name or 6-digit code.")
+                return
+
+            app_key = os.getenv("KIS_APP_KEY")
+            app_secret = os.getenv("KIS_APP_SECRET")
+            base_url = os.getenv("KIS_BASE_URL")
+            kis_enabled = bool(app_key and app_secret)
+            client = KisClient(app_key, app_secret, base_url=base_url) if kis_enabled else None
+
+            def worker():
+                set_status("Fetching (KR)...")
+                dart_data = None
+                dart_error = None
+                snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
+                try:
+                    if kis_enabled and client:
+                        snapshot = client.get_snapshot_with_financials(code)
+                except Exception as exc:  # broad catch to show UI errors
+                    set_status("KIS 실패, DART만 표시")
+                    snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
+
+                market_price = parse_amount(snapshot.price)
+
+                try:
+                    dart_data = fetch_dart_financials(
+                        user_input,
+                        fallback_listed_shares=snapshot.listed_shares,
+                        market_price=market_price,
+                    )
+                    if dart_data and dart_data.get("corp_name"):
+                        snapshot.name = dart_data.get("corp_name")
+                    if dart_data and dart_data.get("corp_code"):
+                        snapshot.code = dart_data.get("corp_code")
+                except Exception as exc:
+                    dart_error = str(exc)
+
+                update_view(snapshot, dart_data)
+                if dart_error:
+                    set_status(f"DART 실패: {dart_error}")
+                else:
+                    set_status("Done")
+
+            threading.Thread(target=worker, daemon=True).start()
+            return
 
         def worker():
-            set_status("Fetching...")
-            dart_data = None
-            dart_error = None
-            snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
+            set_status("Fetching (US)...")
             try:
-                if kis_enabled and client:
-                    snapshot = client.get_snapshot_with_financials(code)
-            except Exception as exc:  # broad catch to show UI errors
-                set_status("KIS 실패, DART만 표시")
-                snapshot = PriceSnapshot(name="N/A", code=code, price="N/A", per="N/A", pbr="N/A")
-
-            market_price = parse_amount(snapshot.price)
-
-            try:
-                dart_data = fetch_dart_financials(
-                    user_input,
-                    fallback_listed_shares=snapshot.listed_shares,
-                    market_price=market_price,
-                )
-                if dart_data and dart_data.get("corp_name"):
-                    snapshot.name = dart_data.get("corp_name")
-                if dart_data and dart_data.get("corp_code"):
-                    snapshot.code = dart_data.get("corp_code")
+                snapshot, detail = fetch_edgar_financials(user_input)
             except Exception as exc:
-                dart_error = str(exc)
+                messagebox.showerror("EDGAR lookup failed", str(exc))
+                update_view(PriceSnapshot(name="N/A", code=user_input or "-", price="N/A", per="N/A", pbr="N/A"), None)
+                set_status(f"EDGAR 실패: {exc}")
+                return
 
-            update_view(snapshot, dart_data)
-            if dart_error:
-                set_status(f"DART 실패: {dart_error}")
-            else:
-                set_status("Done")
+            update_view(snapshot, detail)
+            set_status("Done")
 
         threading.Thread(target=worker, daemon=True).start()
 
     ttk.Label(root, text="Company name or code").grid(row=0, column=0, sticky="w")
+    ttk.Label(root, text="Country").grid(row=0, column=1, sticky="e")
+    country_combo = ttk.Combobox(root, textvariable=country_var, values=("US", "KR"), state="readonly", width=8)
+    country_combo.grid(row=0, column=2, sticky="ew")
     entry = ttk.Entry(root, textvariable=input_var)
     entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
     entry.focus()
     ttk.Button(root, text="Lookup", command=do_fetch).grid(row=1, column=1, sticky="ew")
-    ttk.Button(root, text="Range Scan", command=open_scan_modal).grid(row=1, column=2, sticky="ew", padx=(8, 0))
+    scan_button = ttk.Button(root, text="Range Scan", command=open_scan_modal)
+    scan_button.grid(row=1, column=2, sticky="ew", padx=(8, 0))
+
+    def update_controls_for_country(event=None):
+        if country_var.get() == "KR":
+            scan_button.state(["!disabled"])
+        else:
+            scan_button.state(["disabled"])
+
+    country_combo.bind("<<ComboboxSelected>>", update_controls_for_country)
+    update_controls_for_country()
 
     root.grid_columnconfigure(0, weight=1)
     root.grid_columnconfigure(1, weight=0)
