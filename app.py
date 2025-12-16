@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 # Load .env so users can keep keys out of the code.
 load_dotenv(dotenv_path=".env")
 
+ASSUME_ZERO_DEBT_WHEN_MISSING = os.getenv("NET_CASH_ASSUME_ZERO_DEBT", "").lower() in ("1", "true", "yes", "y")
+
 KRX_LISTING_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_MULTI_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttMultiAcnt.json"
@@ -426,12 +428,19 @@ def _sum_or_none(values) -> Optional[int]:
     return sum(filtered) if filtered else None
 
 
-def compute_net_cash(liquid_funds: Optional[int], interest_bearing_debt: Optional[int]):
-    """Return (net_cash, debt_value) applying debt=0 fallback when liquid_funds exists."""
+def compute_net_cash(
+    liquid_funds: Optional[int],
+    interest_bearing_debt: Optional[int],
+    assume_zero_debt_when_missing: bool = False,
+):
+    """Return (net_cash, debt_value) with optional conservative zero-debt fallback."""
     if liquid_funds is None:
         return None, interest_bearing_debt
-    debt_value = interest_bearing_debt if interest_bearing_debt is not None else 0
-    return liquid_funds - debt_value, debt_value
+    if interest_bearing_debt is None:
+        if assume_zero_debt_when_missing:
+            return liquid_funds, 0
+        return None, None
+    return liquid_funds - interest_bearing_debt, interest_bearing_debt
 
 
 def parse_stock_totals(entries) -> Optional[int]:
@@ -591,6 +600,7 @@ def fetch_dart_financials(
         short_term_products = find_account_amount(combined, "단기금융상품")
         amortized_assets = find_account_amount(combined, "단기상각후원가금융자산")
         fvpl_assets = find_account_amount(combined, "단기당기손익-공정가치금융자산")
+        equity_value = find_account_amount(combined, "자본총계")
 
         if cash_equivalents is not None:
             summary["현금및현금성자산"] = format_amount(cash_equivalents)
@@ -611,7 +621,16 @@ def fetch_dart_financials(
             [short_borrowings, current_long_term_debt, bonds, long_borrowings]
         )
 
-        net_cash, debt_value = compute_net_cash(liquid_funds, interest_bearing_debt)
+        net_cash, debt_value = compute_net_cash(
+            liquid_funds, interest_bearing_debt, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
+        )
+
+        ib_debt_ratio_pct = None
+        if debt_value is not None and equity_value not in (None, 0):
+            try:
+                ib_debt_ratio_pct = (debt_value / equity_value) * 100
+            except Exception:
+                ib_debt_ratio_pct = None
 
         float_shares = None
         try:
@@ -645,6 +664,7 @@ def fetch_dart_financials(
 
         net_cash_display = format_amount(net_cash) if net_cash is not None else "N/A"
         float_shares_display = format_amount(float_shares) if float_shares is not None else None
+        ib_debt_ratio_text = f"{ib_debt_ratio_pct:,.2f}" if ib_debt_ratio_pct is not None else "N/A"
 
         return {
             "corp_name": corp_name,
@@ -661,6 +681,9 @@ def fetch_dart_financials(
             "float_shares_display": float_shares_display,
             "net_cash_per_share": net_cash_per_share,
             "net_cash_per_share_ratio": net_cash_per_share_ratio,
+            "equity": equity_value,
+            "interest_bearing_debt_ratio": ib_debt_ratio_text,
+            "interest_bearing_debt_ratio_value": ib_debt_ratio_pct,
         }
 
     raise DartError(last_error or "조회 가능한 연도가 없습니다.")
@@ -1084,23 +1107,76 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
     name = company.get("name") or ticker
 
     facts = load_company_facts(cik)
-    cash_val = _parse_int(_extract_latest_fact(facts, "CashAndCashEquivalentsAtCarryingValue"))
-    short_inv = _parse_int(
-        _extract_latest_fact(facts, "MarketableSecuritiesCurrent")
-        or _extract_latest_fact(facts, "ShortTermInvestments")
-    )
-    liquid_funds = _sum_or_none([cash_val, short_inv])
 
-    debt_current = _parse_int(
-        _extract_latest_fact(facts, "DebtCurrent")
-        or _extract_latest_fact(facts, "LongTermDebtCurrent")
+    def pick_fact(tags):
+        for tag in tags:
+            val = _extract_latest_fact(facts, tag)
+            if val is not None:
+                return _parse_int(val), tag
+        return None, None
+
+    cash_val, cash_tag = pick_fact(("CashAndCashEquivalentsAtCarryingValue",))
+    current_marketable, current_marketable_tag = pick_fact(
+        ("MarketableSecuritiesCurrent", "ShortTermInvestments")
     )
-    debt_noncurrent = _parse_int(
-        _extract_latest_fact(facts, "LongTermDebt")
-        or _extract_latest_fact(facts, "LongTermDebtNoncurrent")
+    noncurrent_marketable, noncurrent_marketable_tag = pick_fact(
+        (
+            "MarketableSecuritiesNoncurrent",
+            "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+            "LongTermInvestments",
+            "LongTermMarketableSecurities",
+            "OtherInvestmentsNoncurrent",
+        )
     )
-    total_debt = _sum_or_none([debt_current, debt_noncurrent])
-    net_cash, debt_value = compute_net_cash(liquid_funds, total_debt)
+
+    liquid_funds_current = _sum_or_none([cash_val, current_marketable])
+    liquid_funds_total = _sum_or_none([cash_val, current_marketable, noncurrent_marketable])
+
+    # Debt: prefer explicit current/noncurrent; fall back to total-only tag.
+    debt_current, debt_current_tag = pick_fact(
+        (
+            "DebtCurrent",
+            "LongTermDebtCurrent",
+            "CurrentPortionOfLongTermDebt",
+            "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
+            "ShortTermBorrowings",
+            "CommercialPaper",
+        )
+    )
+    debt_noncurrent, debt_noncurrent_tag = pick_fact(
+        (
+            "LongTermDebtNoncurrent",
+            "DebtNoncurrent",
+            "LongTermBorrowings",
+            "LongTermLoansPayable",
+            "LongTermNotesPayable",
+            "LongTermConvertibleDebt",
+        )
+    )
+    debt_total_only, debt_total_tag = pick_fact(
+        (
+            "LongTermDebt",
+            "DebtAndCapitalLeaseObligations",
+            "LongTermDebtAndCapitalLeaseObligations",
+        )
+    )
+
+    total_debt = None
+    debt_tags_used = {}
+    if debt_current is not None or debt_noncurrent is not None:
+        total_debt = _sum_or_none([debt_current, debt_noncurrent])
+        if debt_current_tag:
+            debt_tags_used["current"] = debt_current_tag
+        if debt_noncurrent_tag:
+            debt_tags_used["noncurrent"] = debt_noncurrent_tag
+    elif debt_total_only is not None:
+        total_debt = debt_total_only
+        if debt_total_tag:
+            debt_tags_used["total_only"] = debt_total_tag
+
+    net_cash, debt_value = compute_net_cash(
+        liquid_funds_total, total_debt, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
+    )
 
     shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
 
@@ -1178,7 +1254,7 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         price=clean_number(price_val) if price_val is not None else "N/A",
         per=clean_number(per_val) if per_val is not None else "N/A",
         pbr=clean_number(pbr_val) if pbr_val is not None else "N/A",
-        cash=format_amount(liquid_funds) if liquid_funds is not None else "N/A",
+        cash=format_amount(liquid_funds_total) if liquid_funds_total is not None else "N/A",
         debt_ratio=debt_ratio_text,
         listed_shares=shares,
         net_cash_per_share_ratio=net_cash_per_share_ratio,
@@ -1196,7 +1272,9 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "cik": cik,
         "bsns_year": "-",  # EDGAR facts API is period-agnostic; surface aggregate only.
         "summary": detail_summary,
-        "liquid_funds": liquid_funds,
+        "liquid_funds_total": liquid_funds_total,
+        "liquid_funds_current": liquid_funds_current,
+        "liquid_funds_noncurrent": noncurrent_marketable,
         "interest_bearing_debt": debt_value,
         "net_cash": net_cash,
         "net_cash_display": format_amount(net_cash) if net_cash is not None else "N/A",
@@ -1208,6 +1286,19 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "quote_error": quote_error,
         "debt_ratio": debt_ratio_text,
         "usd_krw_rate": usdkrw_rate,
+        "edgar_liquid_breakdown": {
+            "cash_and_equivalents": cash_val,
+            "marketable_securities_current": current_marketable,
+            "marketable_securities_noncurrent": noncurrent_marketable,
+            "total_current": liquid_funds_current,
+            "total_including_noncurrent": liquid_funds_total,
+        },
+        "edgar_liquid_tags_used": {
+            "cash": cash_tag,
+            "marketable_current": current_marketable_tag,
+            "marketable_noncurrent": noncurrent_marketable_tag,
+        },
+        "edgar_debt_tags_used": debt_tags_used,
     }
 
     return snapshot, detail
@@ -1302,11 +1393,13 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     ncs = result.get("net_cash_per_share", "N/A")
     ncs_ratio = result.get("net_cash_per_share_ratio", "N/A")
     net_cash_display = result.get("net_cash_display", "N/A")
+    ib_debt_ratio = result.get("interest_bearing_debt_ratio", "N/A")
 
     print(f"{corp_name} ({corp_code}) - 사업연도 {bsns_year}")
     print(f"주당 순현금: {ncs}")
     print(f"주당 순현금/주가: {ncs_ratio}")
     print(f"순현금(총액): {net_cash_display}")
+    print(f"이자부채/자본: {ib_debt_ratio}")
     for label in ("매출액", "영업이익", "당기순이익", "자산총계", "부채총계", "자본총계"):
         print(f"{label}: {summary.get(label, 'N/A')}")
     return 0
@@ -1377,6 +1470,8 @@ def build_gui():
         pbr_max_var = tk.StringVar()
         debt_min_var = tk.StringVar()
         debt_max_var = tk.StringVar()
+        ib_debt_min_var = tk.StringVar()
+        ib_debt_max_var = tk.StringVar()
         ncs_ratio_min_var = tk.StringVar()
         ncs_ratio_max_var = tk.StringVar()
         scan_status_var = tk.StringVar(value="범위를 입력 후 Scan을 눌러주세요.")
@@ -1392,11 +1487,12 @@ def build_gui():
 
         add_field(0, "PER", per_min_var, per_max_var)
         add_field(1, "PBR", pbr_min_var, pbr_max_var)
-        add_field(2, "부채비율", debt_min_var, debt_max_var)
-        add_field(3, "주당 순현금/주가(%)", ncs_ratio_min_var, ncs_ratio_max_var)
+        add_field(2, "부채비율(KIS)", debt_min_var, debt_max_var)
+        add_field(3, "이자부채/자본(%)", ib_debt_min_var, ib_debt_max_var)
+        add_field(4, "주당 순현금/주가(%)", ncs_ratio_min_var, ncs_ratio_max_var)
 
-        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=4, rowspan=2, padx=4)
-        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=2, column=4, rowspan=2, padx=4)
+        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=4, rowspan=3, padx=4)
+        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=3, column=4, rowspan=2, padx=4)
 
         columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio")
         tree = ttk.Treeview(modal, columns=columns, show="headings", height=16)
@@ -1405,7 +1501,7 @@ def build_gui():
             ("code", "Code", 80),
             ("per", "PER", 80),
             ("pbr", "PBR", 80),
-            ("debt", "부채비율", 100),
+            ("debt", "부채비율(KIS)", 110),
             ("net_cash_ratio", "주당순현금/주가", 140),
         ):
             tree.heading(col, text=text)
@@ -1426,6 +1522,8 @@ def build_gui():
                 pbr_max = parse_float(pbr_max_var.get())
                 debt_min = parse_float(debt_min_var.get())
                 debt_max = parse_float(debt_max_var.get())
+                ib_debt_min = parse_float(ib_debt_min_var.get())
+                ib_debt_max = parse_float(ib_debt_max_var.get())
                 ncsr_min = parse_float(ncs_ratio_min_var.get())
                 ncsr_max = parse_float(ncs_ratio_max_var.get())
             except Exception:
@@ -1482,12 +1580,14 @@ def build_gui():
                             )
                             ncs_ratio_text = dart_data.get("net_cash_per_share_ratio", "N/A")
                             ncs_ratio_val = parse_float(ncs_ratio_text)
+                            ib_de_ratio_val = dart_data.get("interest_bearing_debt_ratio_value")
 
                             if not (
                                 in_range(per_val, per_min, per_max)
                                 and in_range(pbr_val, pbr_min, pbr_max)
                                 and in_range(debt_val, debt_min, debt_max)
                                 and in_range(ncs_ratio_val, ncsr_min, ncsr_max)
+                                and in_range(ib_de_ratio_val, ib_debt_min, ib_debt_max)
                             ):
                                 continue
 
@@ -1523,6 +1623,17 @@ def build_gui():
             pass
 
     def update_view(snapshot: PriceSnapshot, dart_data=None):
+        debt_display = snapshot.debt_ratio
+        try:
+            if dart_data:
+                ib_ratio = dart_data.get("interest_bearing_debt_ratio")
+                if ib_ratio not in (None, "N/A", ""):
+                    if debt_display not in (None, "N/A", ""):
+                        debt_display = f"{debt_display} (D/E ib: {ib_ratio}%)"
+                    else:
+                        debt_display = f"D/E ib: {ib_ratio}%"
+        except Exception:
+            debt_display = snapshot.debt_ratio
         try:
             root.after(
                 0,
@@ -1531,7 +1642,7 @@ def build_gui():
                     price_var.set(snapshot.price),
                     per_var.set(snapshot.per),
                     pbr_var.set(snapshot.pbr),
-                    debt_var.set(snapshot.debt_ratio),
+                    debt_var.set(debt_display),
                 ),
             )
         except Exception:
@@ -1677,7 +1788,7 @@ def build_gui():
     add_row("Price", price_var, 1)
     add_row("PER", per_var, 2)
     add_row("PBR", pbr_var, 3)
-    add_row("Debt ratio", debt_var, 4)
+    add_row("Debt ratio (KIS)", debt_var, 4)
     add_row("사업연도(DART)", dart_year_var, 5)
     add_row("주당 순현금", dart_net_cash_ps_var, 6)
     add_row("주당 순현금/주가", dart_net_cash_ps_ratio_var, 7)
