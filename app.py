@@ -332,6 +332,19 @@ def format_amount(value) -> str:
     return f"{amount:,}"
 
 
+def format_usd_with_krw(amount: Optional[int], usdkrw_rate: Optional[float]) -> str:
+    if amount is None:
+        return "N/A"
+    usd_text = f"${amount:,}"
+    if usdkrw_rate is None:
+        return usd_text
+    try:
+        krw = int(amount * usdkrw_rate)
+        return f"{usd_text} (₩{krw:,} @ {usdkrw_rate:,.2f})"
+    except Exception:
+        return usd_text
+
+
 def format_per_share(cash_value: Optional[int], shares: Optional[int]) -> str:
     if cash_value is None or shares is None or shares <= 0:
         return "N/A"
@@ -688,6 +701,8 @@ def _extract_latest_fact(
     candidates = []
     priority_map = {form: idx for idx, form in enumerate(forms_priority)}
 
+    today_ord = datetime.date.today().toordinal()
+
     for unit in units:
         for item in unit_map.get(unit, []):
             val = item.get("val")
@@ -700,7 +715,61 @@ def _extract_latest_fact(
             form = item.get("form", "")
             priority = priority_map.get(form, len(forms_priority))
             end_ts = _parse_iso_date(item.get("end") or "") or _parse_iso_date(item.get("filed") or "")
+            # Skip future-dated facts that can appear in companyfacts payloads.
+            if end_ts and end_ts > today_ord:
+                continue
             candidates.append((priority, end_ts, val_num))
+
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda c: (c[0], -c[1]))
+    return best[2]
+
+
+def _extract_latest_fact_any(
+    facts: Dict,
+    keys,
+    units=("USD",),
+    forms_priority=SEC_FORM_PRIORITY,
+) -> Optional[float]:
+    """Try multiple fact keys and return the first available latest value."""
+    for key in keys:
+        val = _extract_latest_fact(facts, key, units=units, forms_priority=forms_priority)
+        if val is not None:
+            return val
+    return None
+
+
+def _extract_latest_fact_multi(
+    facts: Dict,
+    keys,
+    units=("USD",),
+    forms_priority=SEC_FORM_PRIORITY,
+) -> Optional[float]:
+    """Choose the latest/most-prioritized fact across multiple keys."""
+    facts_root = (facts or {}).get("facts", {}).get("us-gaap", {})
+    priority_map = {form: idx for idx, form in enumerate(forms_priority)}
+    candidates = []
+    today_ord = datetime.date.today().toordinal()
+
+    for key in keys:
+        entry = facts_root.get(key) or {}
+        unit_map = entry.get("units") or {}
+        for unit in units:
+            for item in unit_map.get(unit, []):
+                val = item.get("val")
+                if val in (None, "", "-", "NaN"):
+                    continue
+                try:
+                    val_num = float(val)
+                except Exception:
+                    continue
+                form = item.get("form", "")
+                priority = priority_map.get(form, len(forms_priority))
+                end_ts = _parse_iso_date(item.get("end") or "") or _parse_iso_date(item.get("filed") or "")
+                if end_ts and end_ts > today_ord:
+                    continue
+                candidates.append((priority, end_ts, val_num))
 
     if not candidates:
         return None
@@ -733,6 +802,43 @@ def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
         last_error = str(exc)
 
     return fetch_stooq_quote(ticker, last_error)
+
+
+def fetch_usdkrw_rate() -> Optional[float]:
+    """Fetch USD/KRW on each lookup with optional .env override fallback."""
+    env_rate = parse_float(os.getenv("USD_KRW_RATE"))
+    if env_rate:
+        return env_rate
+    try:
+        resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": "USDKRW=X"}, timeout=10)
+        if resp.status_code != 200:
+            raise EdgarError(f"USD/KRW request failed: HTTP {resp.status_code}")
+        result = resp.json().get("quoteResponse", {}).get("result", [])
+        if not result:
+            raise EdgarError("USD/KRW quote not found")
+        price = result[0].get("regularMarketPrice")
+        if price is not None:
+            return float(price)
+    except Exception:
+        pass
+
+    # Fallback: Stooq daily close for usdkrw.
+    try:
+        resp = requests.get(STOOQ_QUOTE_URL, params={"s": "usdkrw", "i": "d"}, timeout=10)
+        if resp.status_code != 200:
+            return env_rate
+        lines = resp.text.strip().splitlines()
+        if not lines or "," not in lines[0]:
+            return env_rate
+        parts = lines[0].split(",")
+        if len(parts) >= 7:
+            close_price = parse_float(parts[6])
+            if close_price:
+                return close_price
+    except Exception:
+        return env_rate
+
+    return env_rate
 
 
 def fetch_stooq_quote(ticker: str, yahoo_error: Optional[str] = None) -> Dict[str, Optional[float]]:
@@ -998,13 +1104,21 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
 
     shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
 
-    revenue = _parse_int(_extract_latest_fact(facts, "Revenues") or _extract_latest_fact(facts, "SalesRevenueNet"))
+    revenue_keys = (
+        "Revenues",
+        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueGoodsNet",
+        "SalesRevenueServicesNet",
+    )
+    revenue = _parse_int(_extract_latest_fact_multi(facts, revenue_keys))
     op_income = _parse_int(_extract_latest_fact(facts, "OperatingIncomeLoss"))
     net_income = _parse_int(_extract_latest_fact(facts, "NetIncomeLoss"))
     equity = _parse_int(
         _extract_latest_fact(facts, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
         or _extract_latest_fact(facts, "StockholdersEquity")
     )
+    usdkrw_rate = fetch_usdkrw_rate()
 
     quote = {}
     quote_error = None
@@ -1071,9 +1185,9 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
     )
 
     detail_summary = {
-        "매출액": format_amount(revenue) if revenue is not None else "N/A",
-        "영업이익": format_amount(op_income) if op_income is not None else "N/A",
-        "자본총계": format_amount(equity) if equity is not None else "N/A",
+        "매출액": format_usd_with_krw(revenue, usdkrw_rate),
+        "영업이익": format_usd_with_krw(op_income, usdkrw_rate),
+        "자본총계": format_usd_with_krw(equity, usdkrw_rate),
     }
 
     detail = {
@@ -1093,6 +1207,7 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "quote_source": quote_source,
         "quote_error": quote_error,
         "debt_ratio": debt_ratio_text,
+        "usd_krw_rate": usdkrw_rate,
     }
 
     return snapshot, detail
