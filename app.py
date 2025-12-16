@@ -1,5 +1,7 @@
 import argparse
+import gzip
 import io
+import json
 import os
 import platform
 import re
@@ -11,7 +13,7 @@ import datetime
 from dataclasses import dataclass
 from functools import lru_cache
 from html import unescape
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import xml.etree.ElementTree as ET
 
@@ -33,6 +35,11 @@ SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 STOOQ_QUOTE_URL = "https://stooq.pl/q/l/"
 SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
+
+EDGAR_BULK_URL = "https://www.sec.gov/files/companyfacts.zip"
+EDGAR_CACHE_DIR = os.getenv("EDGAR_CACHE_DIR", ".cache")
+DEFAULT_EDGAR_CACHE_PATH = os.getenv("EDGAR_CACHE_PATH", os.path.join(EDGAR_CACHE_DIR, "edgar_cache.jsonl.gz"))
+YAHOO_QUOTE_BATCH = max(1, int(os.getenv("YAHOO_QUOTE_BATCH", "35")))
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
 REPORT_SCHEDULE = (
@@ -198,6 +205,11 @@ def sec_headers() -> Dict[str, str]:
         "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate",
     }
+
+
+def get_edgar_cache_path(custom_path: Optional[str] = None) -> str:
+    """Return the EDGAR cache file path, honoring env override."""
+    return custom_path or DEFAULT_EDGAR_CACHE_PATH
 
 
 @lru_cache(maxsize=1)
@@ -800,6 +812,145 @@ def _extract_latest_fact_multi(
     return best[2]
 
 
+def summarize_edgar_facts(facts: Dict) -> Dict[str, Optional[float]]:
+    """Extract core fundamentals from EDGAR companyfacts payload."""
+    cash_val = _parse_int(_extract_latest_fact(facts, "CashAndCashEquivalentsAtCarryingValue"))
+    current_marketable = _parse_int(
+        _extract_latest_fact_any(facts, ("MarketableSecuritiesCurrent", "ShortTermInvestments"))
+    )
+    noncurrent_marketable = _parse_int(
+        _extract_latest_fact_multi(
+            facts,
+            (
+                "MarketableSecuritiesNoncurrent",
+                "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+                "LongTermInvestments",
+                "LongTermMarketableSecurities",
+                "OtherInvestmentsNoncurrent",
+            ),
+        )
+    )
+
+    liquid_funds_current = _sum_or_none([cash_val, current_marketable])
+    liquid_funds_total = _sum_or_none([cash_val, current_marketable, noncurrent_marketable])
+
+    debt_current_base = _parse_int(
+        _extract_latest_fact_multi(
+            facts,
+            (
+                "DebtCurrent",
+                "LongTermDebtCurrent",
+                "CurrentPortionOfLongTermDebt",
+                "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
+                "ShortTermBorrowings",
+            ),
+        )
+    )
+    commercial_paper_val = _parse_int(_extract_latest_fact(facts, "CommercialPaper"))
+    debt_noncurrent = _parse_int(
+        _extract_latest_fact_multi(
+            facts,
+            (
+                "LongTermDebtNoncurrent",
+                "DebtNoncurrent",
+                "LongTermBorrowings",
+                "LongTermLoansPayable",
+                "LongTermNotesPayable",
+                "LongTermConvertibleDebt",
+            ),
+        )
+    )
+    debt_total_only = _parse_int(
+        _extract_latest_fact_multi(
+            facts,
+            (
+                "LongTermDebt",
+                "DebtAndCapitalLeaseObligations",
+                "LongTermDebtAndCapitalLeaseObligations",
+            ),
+        )
+    )
+
+    debt_tags_used: Dict[str, str] = {}
+    current_debt_total = None
+    if debt_current_base is None:
+        current_debt_total = commercial_paper_val
+    elif commercial_paper_val is None:
+        current_debt_total = debt_current_base
+    else:
+        try:
+            rel_diff = abs(debt_current_base - commercial_paper_val) / max(debt_current_base, commercial_paper_val)
+        except Exception:
+            rel_diff = 0
+        if rel_diff <= 0.01:
+            current_debt_total = max(debt_current_base, commercial_paper_val)
+        else:
+            current_debt_total = _sum_or_none([debt_current_base, commercial_paper_val])
+
+    total_debt = None
+    if current_debt_total is not None or debt_noncurrent is not None:
+        total_debt = _sum_or_none([current_debt_total, debt_noncurrent])
+        if debt_current_base is not None:
+            debt_tags_used["current_base"] = "DebtCurrent"
+        if commercial_paper_val is not None:
+            debt_tags_used["commercial_paper"] = "CommercialPaper"
+        if debt_noncurrent is not None:
+            debt_tags_used["noncurrent"] = "DebtNoncurrent"
+    elif debt_total_only is not None:
+        total_debt = debt_total_only
+        debt_tags_used["total_only"] = "LongTermDebt"
+
+    net_cash, debt_value = compute_net_cash(
+        liquid_funds_total, total_debt, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
+    )
+
+    revenue = _parse_int(
+        _extract_latest_fact_multi(
+            facts,
+            (
+                "Revenues",
+                "SalesRevenueNet",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "SalesRevenueGoodsNet",
+                "SalesRevenueServicesNet",
+            ),
+        )
+    )
+    op_income = _parse_int(_extract_latest_fact(facts, "OperatingIncomeLoss"))
+    net_income = _parse_int(_extract_latest_fact(facts, "NetIncomeLoss"))
+    equity = _parse_int(
+        _extract_latest_fact(
+            facts,
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        )
+        or _extract_latest_fact(facts, "StockholdersEquity")
+    )
+    shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
+
+    if debt_ratio_pct is None and debt_value is not None and equity not in (None, 0):
+        try:
+            debt_ratio_pct = (debt_value / equity) * 100
+        except Exception:
+            debt_ratio_pct = None
+
+    return {
+        "cash_and_equivalents": cash_val,
+        "marketable_securities_current": current_marketable,
+        "marketable_securities_noncurrent": noncurrent_marketable,
+        "liquid_funds_current": liquid_funds_current,
+        "liquid_funds_total": liquid_funds_total,
+        "interest_bearing_debt": debt_value,
+        "net_cash": net_cash,
+        "revenue": revenue,
+        "op_income": op_income,
+        "net_income": net_income,
+        "equity": equity,
+        "shares": shares,
+        "debt_ratio_pct": debt_ratio_pct,
+        "debt_tags_used": debt_tags_used,
+    }
+
+
 def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
     last_error = None
     try:
@@ -825,6 +976,37 @@ def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
         last_error = str(exc)
 
     return fetch_stooq_quote(ticker, last_error)
+
+
+def fetch_yahoo_quotes_batch(tickers: List[str], batch_size: int = YAHOO_QUOTE_BATCH):
+    """Batch Yahoo quote lookup to reduce API calls."""
+    results: Dict[str, Dict[str, Optional[float]]] = {}
+    last_error = None
+    symbols = [t for t in tickers if t]
+    for idx in range(0, len(symbols), max(1, batch_size)):
+        chunk = symbols[idx : idx + max(1, batch_size)]
+        try:
+            resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": ",".join(chunk)}, timeout=10)
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            payload = resp.json()
+            entries = payload.get("quoteResponse", {}).get("result", [])
+            for entry in entries:
+                sym = str(entry.get("symbol") or "").upper()
+                if not sym:
+                    continue
+                results[sym] = {
+                    "price": entry.get("regularMarketPrice"),
+                    "per": entry.get("trailingPE"),
+                    "pbr": entry.get("priceToBook"),
+                    "currency": entry.get("currency"),
+                    "source": "yahoo",
+                }
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    return results, last_error
 
 
 def fetch_usdkrw_rate() -> Optional[float]:
@@ -1108,110 +1290,25 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
 
     facts = load_company_facts(cik)
 
-    def pick_fact(tags):
-        for tag in tags:
-            val = _extract_latest_fact(facts, tag)
-            if val is not None:
-                return _parse_int(val), tag
-        return None, None
-
-    cash_val, cash_tag = pick_fact(("CashAndCashEquivalentsAtCarryingValue",))
-    current_marketable, current_marketable_tag = pick_fact(
-        ("MarketableSecuritiesCurrent", "ShortTermInvestments")
-    )
-    noncurrent_marketable, noncurrent_marketable_tag = pick_fact(
-        (
-            "MarketableSecuritiesNoncurrent",
-            "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
-            "LongTermInvestments",
-            "LongTermMarketableSecurities",
-            "OtherInvestmentsNoncurrent",
-        )
-    )
-
-    liquid_funds_current = _sum_or_none([cash_val, current_marketable])
-    liquid_funds_total = _sum_or_none([cash_val, current_marketable, noncurrent_marketable])
-
-    # Debt: prefer explicit current/noncurrent; fall back to total-only tag.
-    debt_current_base, debt_current_base_tag = pick_fact(
-        (
-            "DebtCurrent",
-            "LongTermDebtCurrent",
-            "CurrentPortionOfLongTermDebt",
-            "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
-            "ShortTermBorrowings",
-        )
-    )
-    commercial_paper_val = _parse_int(_extract_latest_fact(facts, "CommercialPaper"))
-    debt_noncurrent, debt_noncurrent_tag = pick_fact(
-        (
-            "LongTermDebtNoncurrent",
-            "DebtNoncurrent",
-            "LongTermBorrowings",
-            "LongTermLoansPayable",
-            "LongTermNotesPayable",
-            "LongTermConvertibleDebt",
-        )
-    )
-    debt_total_only, debt_total_tag = pick_fact(
-        (
-            "LongTermDebt",
-            "DebtAndCapitalLeaseObligations",
-            "LongTermDebtAndCapitalLeaseObligations",
-        )
-    )
-
-    # Combine current debt base + commercial paper with de-duplication tolerance.
-    current_debt_total = None
-    if debt_current_base is None:
-        current_debt_total = commercial_paper_val
-    elif commercial_paper_val is None:
-        current_debt_total = debt_current_base
-    else:
-        try:
-            rel_diff = abs(debt_current_base - commercial_paper_val) / max(debt_current_base, commercial_paper_val)
-        except Exception:
-            rel_diff = 0
-        if rel_diff <= 0.01:
-            current_debt_total = max(debt_current_base, commercial_paper_val)
-        else:
-            current_debt_total = debt_current_base + commercial_paper_val
-
-    total_debt = None
-    debt_tags_used = {}
-    if current_debt_total is not None or debt_noncurrent is not None:
-        total_debt = _sum_or_none([current_debt_total, debt_noncurrent])
-        if debt_current_base_tag:
-            debt_tags_used["current_base"] = debt_current_base_tag
-        if commercial_paper_val is not None:
-            debt_tags_used["commercial_paper"] = "CommercialPaper"
-        if debt_noncurrent_tag:
-            debt_tags_used["noncurrent"] = debt_noncurrent_tag
-    elif debt_total_only is not None:
-        total_debt = debt_total_only
-        if debt_total_tag:
-            debt_tags_used["total_only"] = debt_total_tag
-
-    net_cash, debt_value = compute_net_cash(
-        liquid_funds_total, total_debt, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
-    )
-
-    shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
-
-    revenue_keys = (
-        "Revenues",
-        "SalesRevenueNet",
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueGoodsNet",
-        "SalesRevenueServicesNet",
-    )
-    revenue = _parse_int(_extract_latest_fact_multi(facts, revenue_keys))
-    op_income = _parse_int(_extract_latest_fact(facts, "OperatingIncomeLoss"))
-    net_income = _parse_int(_extract_latest_fact(facts, "NetIncomeLoss"))
-    equity = _parse_int(
-        _extract_latest_fact(facts, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
-        or _extract_latest_fact(facts, "StockholdersEquity")
-    )
+    fundamentals = summarize_edgar_facts(facts)
+    cash_val = fundamentals.get("cash_and_equivalents")
+    current_marketable = fundamentals.get("marketable_securities_current")
+    noncurrent_marketable = fundamentals.get("marketable_securities_noncurrent")
+    liquid_funds_current = fundamentals.get("liquid_funds_current")
+    liquid_funds_total = fundamentals.get("liquid_funds_total")
+    total_debt = fundamentals.get("interest_bearing_debt")
+    net_cash = fundamentals.get("net_cash")
+    revenue = fundamentals.get("revenue")
+    op_income = fundamentals.get("op_income")
+    net_income = fundamentals.get("net_income")
+    equity = fundamentals.get("equity")
+    shares = fundamentals.get("shares")
+    debt_ratio_pct = fundamentals.get("debt_ratio_pct")
+    debt_tags_used = fundamentals.get("debt_tags_used") or {}
+    debt_value = total_debt
+    cash_tag = "CashAndCashEquivalentsAtCarryingValue" if cash_val is not None else None
+    current_marketable_tag = "MarketableSecuritiesCurrent" if current_marketable is not None else None
+    noncurrent_marketable_tag = "MarketableSecuritiesNoncurrent" if noncurrent_marketable is not None else None
     usdkrw_rate = fetch_usdkrw_rate()
 
     quote = {}
@@ -1320,6 +1417,269 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
     }
 
     return snapshot, detail
+
+
+def _edgar_cache_meta_path(cache_path: str) -> str:
+    return f"{cache_path}.meta"
+
+
+def build_edgar_cache(
+    cache_path: Optional[str] = None,
+    max_companies: Optional[int] = None,
+    status_cb=None,
+) -> str:
+    """Download companyfacts.zip and build a compressed JSONL cache for US range scans."""
+    path = get_edgar_cache_path(cache_path)
+    cache_dir = os.path.dirname(path) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+
+    def set_status(msg: str):
+        if not status_cb:
+            return
+        try:
+            status_cb(msg)
+        except Exception:
+            pass
+
+    headers = sec_headers()
+    meta_path = _edgar_cache_meta_path(path)
+    last_modified = None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as meta_file:
+            meta = json.load(meta_file)
+            last_modified = meta.get("last_modified")
+    except Exception:
+        last_modified = None
+
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+
+    set_status("Downloading EDGAR companyfacts.zip ...")
+    resp = requests.get(EDGAR_BULK_URL, headers=headers, stream=True, timeout=120)
+    if resp.status_code == 304:
+        set_status("companyfacts.zip not modified; keeping existing cache.")
+        return path
+    if resp.status_code != 200:
+        raise EdgarError(f"Failed to download EDGAR bulk file: HTTP {resp.status_code}")
+
+    tmp_zip = os.path.join(cache_dir, "companyfacts.zip.tmp")
+    with open(tmp_zip, "wb") as fp:
+        for chunk in resp.iter_content(chunk_size=128 * 1024):
+            if chunk:
+                fp.write(chunk)
+
+    ticker_map, _ = load_edgar_ticker_map()
+    cik_to_ticker = {info.get("cik"): ticker for ticker, info in ticker_map.items()}
+
+    tmp_cache = path + ".tmp"
+    processed = 0
+    written = 0
+
+    set_status("Building EDGAR cache from bulk payload ...")
+    with zipfile.ZipFile(tmp_zip) as zf, gzip.open(tmp_cache, "wt", encoding="utf-8") as out_f:
+        for member in zf.namelist():
+            if not member.lower().endswith(".json"):
+                continue
+            processed += 1
+            try:
+                with zf.open(member) as fp:
+                    data = json.load(fp)
+            except Exception:
+                continue
+
+            cik = _pad_cik(data.get("cik") or data.get("entityId") or "")
+            if not cik:
+                continue
+            ticker = cik_to_ticker.get(cik)
+            if not ticker:
+                continue
+
+            fundamentals = summarize_edgar_facts(data)
+            if not fundamentals:
+                continue
+
+            name = ticker_map.get(ticker, {}).get("title") or data.get("entityName") or ticker
+
+            record = {
+                "ticker": ticker,
+                "cik": cik,
+                "name": name,
+                "shares": fundamentals.get("shares"),
+                "equity": fundamentals.get("equity"),
+                "net_income": fundamentals.get("net_income"),
+                "revenue": fundamentals.get("revenue"),
+                "op_income": fundamentals.get("op_income"),
+                "liquid_funds_total": fundamentals.get("liquid_funds_total"),
+                "interest_bearing_debt": fundamentals.get("interest_bearing_debt"),
+                "net_cash": fundamentals.get("net_cash"),
+                "debt_ratio_pct": fundamentals.get("debt_ratio_pct"),
+            }
+
+            out_f.write(json.dumps(record) + "\n")
+            written += 1
+
+            if max_companies and written >= max_companies:
+                break
+            if written % 500 == 0:
+                set_status(f"Processed {written} companies (scanned {processed})")
+
+    os.replace(tmp_cache, path)
+    try:
+        os.remove(tmp_zip)
+    except Exception:
+        pass
+
+    meta = {
+        "last_modified": resp.headers.get("Last-Modified"),
+        "fetched_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "companies": written,
+    }
+    try:
+        with open(meta_path, "w", encoding="utf-8") as meta_file:
+            json.dump(meta, meta_file)
+    except Exception:
+        pass
+
+    set_status(f"EDGAR cache built: {written} companies")
+    return path
+
+
+def iter_edgar_cache(cache_path: Optional[str] = None) -> Iterable[Dict]:
+    """Yield cached EDGAR fundamentals from gzip/jsonl cache."""
+    path = get_edgar_cache_path(cache_path)
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+
+def scan_us_range(
+    filters: Dict[str, Optional[float]],
+    cache_path: Optional[str] = None,
+    price_batch_size: int = YAHOO_QUOTE_BATCH,
+    max_records: Optional[int] = None,
+    status_cb=None,
+    on_match=None,
+) -> Dict[str, Optional[str]]:
+    """Scan EDGAR cache with filters; prices fetched in batches."""
+    path = get_edgar_cache_path(cache_path)
+    if not os.path.exists(path):
+        raise EdgarError(f"EDGAR cache not found at {path}. Run --update-edgar-cache first.")
+
+    processed = 0
+    matched = 0
+    last_error = None
+    pending: List[Dict] = []
+
+    def set_status(text: str):
+        if not status_cb:
+            return
+        try:
+            status_cb(text)
+        except Exception:
+            pass
+
+    def process_batch(batch: List[Dict]):
+        nonlocal matched, processed, last_error
+        if not batch:
+            return
+        tickers = [str(item.get("ticker") or "").upper() for item in batch if item.get("ticker")]
+        quotes, err = fetch_yahoo_quotes_batch(tickers, batch_size=price_batch_size)
+        if err:
+            last_error = err
+
+        for item in batch:
+            ticker = str(item.get("ticker") or "").upper()
+            name = item.get("name") or ticker
+            quote = quotes.get(ticker) or {}
+            price = quote.get("price")
+            per_val = parse_float(quote.get("per"))
+            pbr_val = parse_float(quote.get("pbr"))
+
+            shares = _parse_int(item.get("shares"))
+            equity = _parse_int(item.get("equity"))
+            net_income = _parse_int(item.get("net_income"))
+            net_cash = _parse_int(item.get("net_cash"))
+            debt_ratio_val = parse_float(item.get("debt_ratio_pct"))
+
+            market_cap = None
+            if price is not None and shares:
+                try:
+                    market_cap = price * shares
+                except Exception:
+                    market_cap = None
+
+            if per_val is None and market_cap is not None and net_income not in (None, 0):
+                try:
+                    per_val = market_cap / net_income
+                except Exception:
+                    per_val = None
+            if pbr_val is None and market_cap is not None and equity not in (None, 0):
+                try:
+                    pbr_val = market_cap / equity
+                except Exception:
+                    pbr_val = None
+
+            net_cash_ratio_val = None
+            if price not in (None, 0) and shares and net_cash is not None:
+                try:
+                    net_cash_ratio_val = ((net_cash / shares) / price) * 100
+                except Exception:
+                    net_cash_ratio_val = None
+
+            if not (
+                in_range(per_val, filters.get("per_min"), filters.get("per_max"))
+                and in_range(pbr_val, filters.get("pbr_min"), filters.get("pbr_max"))
+                and in_range(debt_ratio_val, filters.get("debt_min"), filters.get("debt_max"))
+                and in_range(net_cash_ratio_val, filters.get("ncs_ratio_min"), filters.get("ncs_ratio_max"))
+                and in_range(debt_ratio_val, filters.get("ib_debt_min"), filters.get("ib_debt_max"))
+            ):
+                processed += 1
+                continue
+
+            matched += 1
+            processed += 1
+
+            per_text = clean_number(per_val) if per_val is not None else "N/A"
+            pbr_text = clean_number(pbr_val) if pbr_val is not None else "N/A"
+            debt_text = f"{debt_ratio_val:,.2f}" if debt_ratio_val is not None else "N/A"
+            ncs_ratio_text = f"{net_cash_ratio_val:,.2f}%" if net_cash_ratio_val is not None else "N/A"
+
+            if on_match:
+                try:
+                    on_match(
+                        {
+                            "name": name,
+                            "ticker": ticker,
+                            "per": per_text,
+                            "pbr": pbr_text,
+                            "debt_ratio": debt_text,
+                            "net_cash_ratio": ncs_ratio_text,
+                        }
+                    )
+                except Exception:
+                    pass
+
+    for item in iter_edgar_cache(path):
+        pending.append(item)
+        if max_records and processed + len(pending) >= max_records:
+            break
+        if len(pending) >= price_batch_size:
+            process_batch(pending)
+            pending = []
+            set_status(f"Scanning... processed {processed}, matched {matched}")
+
+    if pending:
+        process_batch(pending)
+
+    set_status(f"Done. Processed {processed}, matched {matched}")
+    return {"processed": processed, "matched": matched, "last_error": last_error}
 
 
 def resolve_code(user_text: str) -> Optional[str]:
@@ -1473,13 +1833,20 @@ def build_gui():
     dart_sales_var = tk.StringVar(value="-")
     dart_op_var = tk.StringVar(value="-")
     dart_equity_var = tk.StringVar(value="-")
+    refreshing_us_cache = threading.Event()
 
     def open_scan_modal():
-        if country_var.get() != "KR":
-            messagebox.showinfo("Range Scan", "Range Scan is available for Korea (KR) only.")
-            return
+        selected = country_var.get()
+        if selected == "KR":
+            open_kr_scan_modal()
+        elif selected == "US":
+            open_us_scan_modal()
+        else:
+            messagebox.showinfo("Range Scan", "Select KR or US to run Range Scan.")
+
+    def open_kr_scan_modal():
         modal = tk.Toplevel(root)
-        modal.title("Range Scan")
+        modal.title("Range Scan (KR)")
         modal.geometry("720x520")
         modal.resizable(True, True)
 
@@ -1635,11 +2002,174 @@ def build_gui():
 
             threading.Thread(target=worker, daemon=True).start()
 
+    def open_us_scan_modal():
+        modal = tk.Toplevel(root)
+        modal.title("Range Scan (US, EDGAR cache)")
+        modal.geometry("780x560")
+        modal.resizable(True, True)
+
+        per_min_var = tk.StringVar()
+        per_max_var = tk.StringVar()
+        pbr_min_var = tk.StringVar()
+        pbr_max_var = tk.StringVar()
+        debt_min_var = tk.StringVar()
+        debt_max_var = tk.StringVar()
+        ib_debt_min_var = tk.StringVar()
+        ib_debt_max_var = tk.StringVar()
+        ncs_ratio_min_var = tk.StringVar()
+        ncs_ratio_max_var = tk.StringVar()
+        scan_status_var = tk.StringVar(value="캐시를 먼저 갱신했다면 Scan을 눌러주세요.")
+
+        controls = ttk.Frame(modal, padding=(8, 8))
+        controls.pack(fill="x")
+
+        def add_field(row, label, min_var, max_var):
+            ttk.Label(controls, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(controls, textvariable=min_var, width=10).grid(row=row, column=1, sticky="w", padx=(4, 8))
+            ttk.Label(controls, text="~").grid(row=row, column=2, sticky="w")
+            ttk.Entry(controls, textvariable=max_var, width=10).grid(row=row, column=3, sticky="w", padx=(4, 12))
+
+        add_field(0, "PER", per_min_var, per_max_var)
+        add_field(1, "PBR", pbr_min_var, pbr_max_var)
+        add_field(2, "Debt/Equity(%)", debt_min_var, debt_max_var)
+        add_field(3, "이자부채/자본(%)", ib_debt_min_var, ib_debt_max_var)
+        add_field(4, "주당 순현금/주가(%)", ncs_ratio_min_var, ncs_ratio_max_var)
+
+        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=4, rowspan=3, padx=4)
+        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=3, column=4, rowspan=2, padx=4)
+
+        cache_path = get_edgar_cache_path(None)
+        ttk.Label(modal, text=f"Cache: {cache_path}", anchor="w").pack(fill="x", padx=8, pady=(0, 4))
+
+        columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio")
+        tree = ttk.Treeview(modal, columns=columns, show="headings", height=16)
+        for col, text, width in (
+            ("name", "Name", 200),
+            ("code", "Ticker", 80),
+            ("per", "PER", 80),
+            ("pbr", "PBR", 80),
+            ("debt", "Debt/Equity", 110),
+            ("net_cash_ratio", "Net Cash/Price", 140),
+        ):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="center")
+        tree.pack(fill="both", expand=True, padx=8, pady=(4, 2))
+
+        scrollbar = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        ttk.Label(modal, textvariable=scan_status_var, anchor="w").pack(fill="x", padx=8, pady=(0, 6))
+
+        def start_scan():
+            try:
+                per_min = parse_float(per_min_var.get())
+                per_max = parse_float(per_max_var.get())
+                pbr_min = parse_float(pbr_min_var.get())
+                pbr_max = parse_float(pbr_max_var.get())
+                debt_min = parse_float(debt_min_var.get())
+                debt_max = parse_float(debt_max_var.get())
+                ib_debt_min = parse_float(ib_debt_min_var.get())
+                ib_debt_max = parse_float(ib_debt_max_var.get())
+                ncsr_min = parse_float(ncs_ratio_min_var.get())
+                ncsr_max = parse_float(ncs_ratio_max_var.get())
+            except Exception:
+                scan_status_var.set("입력 파싱 오류")
+                return
+
+            if not os.path.exists(cache_path):
+                scan_status_var.set("EDGAR 캐시가 없습니다. Refresh US Cache를 먼저 실행하세요.")
+                return
+
+            for item in tree.get_children():
+                tree.delete(item)
+            scan_status_var.set("Preparing scan...")
+
+            filters = {
+                "per_min": per_min,
+                "per_max": per_max,
+                "pbr_min": pbr_min,
+                "pbr_max": pbr_max,
+                "debt_min": debt_min,
+                "debt_max": debt_max,
+                "ib_debt_min": ib_debt_min,
+                "ib_debt_max": ib_debt_max,
+                "ncs_ratio_min": ncsr_min,
+                "ncs_ratio_max": ncsr_max,
+            }
+
+            try:
+                env_limit = os.getenv("EDGAR_SCAN_LIMIT", "")
+                max_records = int(env_limit) if env_limit and int(env_limit) > 0 else None
+            except Exception:
+                max_records = None
+
+            def set_scan_status(text: str):
+                try:
+                    root.after(0, lambda: scan_status_var.set(text))
+                except Exception:
+                    pass
+
+            def on_match(record: Dict[str, str]):
+                values = (
+                    record.get("name", "N/A"),
+                    record.get("ticker", "-"),
+                    record.get("per", "N/A"),
+                    record.get("pbr", "N/A"),
+                    record.get("debt_ratio", "N/A"),
+                    record.get("net_cash_ratio", "N/A"),
+                )
+                try:
+                    root.after(0, lambda vals=values: tree.insert("", "end", values=vals))
+                except Exception:
+                    pass
+
+            def worker():
+                set_scan_status("Scanning with EDGAR cache...")
+                try:
+                    result = scan_us_range(
+                        filters,
+                        cache_path=cache_path,
+                        price_batch_size=YAHOO_QUOTE_BATCH,
+                        max_records=max_records,
+                        status_cb=set_scan_status,
+                        on_match=on_match,
+                    )
+                    processed = result.get("processed", 0)
+                    matched = result.get("matched", 0)
+                    last_error = result.get("last_error")
+                    if last_error:
+                        set_scan_status(f"완료: {matched}개 매치 / {processed}개 처리 (마지막 오류: {last_error})")
+                    else:
+                        set_scan_status(f"완료: {matched}개 매치 / {processed}개 처리")
+                except Exception as exc:
+                    set_scan_status(f"오류: {exc}")
+
+            threading.Thread(target=worker, daemon=True).start()
+
     def set_status(text: str):
         try:
             root.after(0, lambda: status_var.set(text))
         except Exception:
             pass
+
+    def refresh_us_cache():
+        if refreshing_us_cache.is_set():
+            set_status("EDGAR 캐시 갱신이 이미 진행 중입니다.")
+            return
+        refreshing_us_cache.set()
+
+        def worker():
+            set_status("EDGAR 캐시 갱신 중...")
+            try:
+                build_edgar_cache(status_cb=set_status)
+                set_status("EDGAR 캐시 갱신 완료")
+            except Exception as exc:
+                set_status(f"EDGAR 캐시 갱신 실패: {exc}")
+            finally:
+                refreshing_us_cache.clear()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def update_view(snapshot: PriceSnapshot, dart_data=None):
         debt_display = snapshot.debt_ratio
@@ -1781,13 +2311,17 @@ def build_gui():
     ttk.Button(root, text="Lookup", command=do_fetch).grid(row=1, column=1, sticky="ew")
     scan_button = ttk.Button(root, text="Range Scan", command=open_scan_modal)
     scan_button.grid(row=1, column=2, sticky="ew", padx=(8, 0))
+    refresh_button = ttk.Button(root, text="Refresh US Cache", command=refresh_us_cache)
+    refresh_button.grid(row=1, column=3, sticky="ew", padx=(8, 0))
 
     def update_controls_for_country(event=None):
         if country_var.get() == "KR":
             scan_button.state(["!disabled"])
+            refresh_button.state(["disabled"])
             debt_label_var.set("부채비율(KIS)")
         else:
-            scan_button.state(["disabled"])
+            scan_button.state(["!disabled"])
+            refresh_button.state(["!disabled"])
             debt_label_var.set("Debt/Equity (EDGAR, %)")
 
     country_combo.bind("<<ComboboxSelected>>", update_controls_for_country)
@@ -1796,9 +2330,10 @@ def build_gui():
     root.grid_columnconfigure(0, weight=1)
     root.grid_columnconfigure(1, weight=0)
     root.grid_columnconfigure(2, weight=0)
+    root.grid_columnconfigure(3, weight=0)
 
     info_frame = ttk.Frame(root)
-    info_frame.grid(row=2, column=0, columnspan=2, pady=(12, 8), sticky="ew")
+    info_frame.grid(row=2, column=0, columnspan=3, pady=(12, 8), sticky="ew")
     info_frame.grid_columnconfigure(1, weight=1)
 
     def add_row(label_text: str, var: tk.StringVar, row_idx: int):
@@ -1819,7 +2354,7 @@ def build_gui():
     add_row("자본총계", dart_equity_var, 10)
 
     status_bar = ttk.Label(root, textvariable=status_var, anchor="w", relief="sunken")
-    status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    status_bar.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
     root.mainloop()
 
@@ -1830,7 +2365,18 @@ if __name__ == "__main__":
     parser.add_argument("--dart", action="store_true", help="Run DART financial summary lookup (CLI)")
     parser.add_argument("--dart-year", dest="dart_year", help="Business year (YYYY) for DART lookup")
     parser.add_argument("--symbol", help="Symbol or code to use in CLI mode")
+    parser.add_argument("--update-edgar-cache", action="store_true", help="Download and rebuild EDGAR cache for US scan")
+    parser.add_argument("--edgar-cache", dest="edgar_cache", help="Path to EDGAR cache file")
     args = parser.parse_args()
+
+    if args.update_edgar_cache:
+        try:
+            build_edgar_cache(cache_path=args.edgar_cache)
+            print(f"EDGAR cache built at {get_edgar_cache_path(args.edgar_cache)}")
+            sys.exit(0)
+        except Exception as exc:
+            print(f"EDGAR cache build failed: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     if args.dart:
         sys.exit(run_dart_cli(args.symbol, args.dart_year))
