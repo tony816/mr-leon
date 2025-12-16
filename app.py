@@ -1133,16 +1133,16 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
     liquid_funds_total = _sum_or_none([cash_val, current_marketable, noncurrent_marketable])
 
     # Debt: prefer explicit current/noncurrent; fall back to total-only tag.
-    debt_current, debt_current_tag = pick_fact(
+    debt_current_base, debt_current_base_tag = pick_fact(
         (
             "DebtCurrent",
             "LongTermDebtCurrent",
             "CurrentPortionOfLongTermDebt",
             "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
             "ShortTermBorrowings",
-            "CommercialPaper",
         )
     )
+    commercial_paper_val = _parse_int(_extract_latest_fact(facts, "CommercialPaper"))
     debt_noncurrent, debt_noncurrent_tag = pick_fact(
         (
             "LongTermDebtNoncurrent",
@@ -1161,12 +1161,30 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         )
     )
 
+    # Combine current debt base + commercial paper with de-duplication tolerance.
+    current_debt_total = None
+    if debt_current_base is None:
+        current_debt_total = commercial_paper_val
+    elif commercial_paper_val is None:
+        current_debt_total = debt_current_base
+    else:
+        try:
+            rel_diff = abs(debt_current_base - commercial_paper_val) / max(debt_current_base, commercial_paper_val)
+        except Exception:
+            rel_diff = 0
+        if rel_diff <= 0.01:
+            current_debt_total = max(debt_current_base, commercial_paper_val)
+        else:
+            current_debt_total = debt_current_base + commercial_paper_val
+
     total_debt = None
     debt_tags_used = {}
-    if debt_current is not None or debt_noncurrent is not None:
-        total_debt = _sum_or_none([debt_current, debt_noncurrent])
-        if debt_current_tag:
-            debt_tags_used["current"] = debt_current_tag
+    if current_debt_total is not None or debt_noncurrent is not None:
+        total_debt = _sum_or_none([current_debt_total, debt_noncurrent])
+        if debt_current_base_tag:
+            debt_tags_used["current_base"] = debt_current_base_tag
+        if commercial_paper_val is not None:
+            debt_tags_used["commercial_paper"] = "CommercialPaper"
         if debt_noncurrent_tag:
             debt_tags_used["noncurrent"] = debt_noncurrent_tag
     elif debt_total_only is not None:
@@ -1766,8 +1784,10 @@ def build_gui():
     def update_controls_for_country(event=None):
         if country_var.get() == "KR":
             scan_button.state(["!disabled"])
+            debt_label_var.set("부채비율(KIS)")
         else:
             scan_button.state(["disabled"])
+            debt_label_var.set("Debt/Equity (EDGAR, %)")
 
     country_combo.bind("<<ComboboxSelected>>", update_controls_for_country)
     update_controls_for_country()
@@ -1788,7 +1808,9 @@ def build_gui():
     add_row("Price", price_var, 1)
     add_row("PER", per_var, 2)
     add_row("PBR", pbr_var, 3)
-    add_row("Debt ratio (KIS)", debt_var, 4)
+    debt_label_var = tk.StringVar(value="Debt/Equity (EDGAR, %)")
+    ttk.Label(info_frame, textvariable=debt_label_var, width=12).grid(row=4, column=0, sticky="w", pady=2)
+    ttk.Label(info_frame, textvariable=debt_var, width=32).grid(row=4, column=1, sticky="w", pady=2)
     add_row("사업연도(DART)", dart_year_var, 5)
     add_row("주당 순현금", dart_net_cash_ps_var, 6)
     add_row("주당 순현금/주가", dart_net_cash_ps_ratio_var, 7)
