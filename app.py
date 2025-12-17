@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import os
 import platform
 import re
@@ -8,10 +9,11 @@ import threading
 import time
 import zipfile
 import datetime
+from pathlib import Path
 from dataclasses import dataclass
 from functools import lru_cache
 from html import unescape
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import xml.etree.ElementTree as ET
 
@@ -33,6 +35,7 @@ SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 STOOQ_QUOTE_URL = "https://stooq.pl/q/l/"
 SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
+SUBMISSIONS_INDEX_FILENAME = "submissions_index.jsonl"
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
 REPORT_SCHEDULE = (
@@ -200,6 +203,239 @@ def sec_headers() -> Dict[str, str]:
     }
 
 
+def find_local_companyfacts_file(cik_padded: str) -> Optional[Path]:
+    filename = f"CIK{cik_padded}.json"
+    candidates = []
+    configured = os.getenv("SEC_COMPANYFACTS_DIR") or os.getenv("EDGAR_COMPANYFACTS_DIR") or os.getenv("COMPANYFACTS_DIR")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path.cwd() / "companyfacts")
+    try:
+        candidates.append(Path(__file__).resolve().parent / "companyfacts")
+    except Exception:
+        pass
+
+    for directory in candidates:
+        try:
+            path = directory / filename
+        except Exception:
+            continue
+        if path.is_file():
+            return path
+    return None
+
+
+def find_local_submissions_dir() -> Optional[Path]:
+    configured = os.getenv("SEC_SUBMISSIONS_DIR") or os.getenv("EDGAR_SUBMISSIONS_DIR") or os.getenv("SUBMISSIONS_DIR")
+    candidates: List[Path] = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path.cwd() / "submissions")
+    try:
+        candidates.append(Path(__file__).resolve().parent / "submissions")
+    except Exception:
+        pass
+    for directory in candidates:
+        try:
+            if directory.is_dir():
+                return directory
+        except Exception:
+            continue
+    return None
+
+
+def submissions_index_path() -> Path:
+    configured = os.getenv("SEC_SUBMISSIONS_INDEX") or os.getenv("EDGAR_SUBMISSIONS_INDEX") or os.getenv("SUBMISSIONS_INDEX")
+    if configured:
+        return Path(configured)
+    return Path.cwd() / SUBMISSIONS_INDEX_FILENAME
+
+
+def _normalize_form_name(value: str) -> str:
+    text = (value or "").upper().strip()
+    if text.startswith("FORM "):
+        text = text[5:]
+    return text.strip()
+
+
+def choose_primary_ticker(tickers: List[str]) -> Optional[str]:
+    cleaned = [t.strip().upper() for t in (tickers or []) if str(t).strip()]
+    if not cleaned:
+        return None
+
+    def score(ticker: str):
+        bad_suffixes = ("WS", "W", "WT", "U", "R")
+        suffix_penalty = 10 if ticker.endswith(bad_suffixes) else 0
+        weird_punct_penalty = 10 if any(ch in ticker for ch in ("^", "/", "=")) else 0
+        punct_penalty = sum(1 for ch in ticker if not ch.isalnum())
+        return (suffix_penalty + weird_punct_penalty, punct_penalty, len(ticker), ticker)
+
+    return min(cleaned, key=score)
+
+
+def _iter_cik_json_files(directory: Path) -> Iterable[Path]:
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if not (name.startswith("CIK") and name.endswith(".json")):
+                    continue
+                yield Path(entry.path)
+    except FileNotFoundError:
+        return
+
+
+def parse_submissions_metadata(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cik = _pad_cik(str(payload.get("cik") or ""))
+    if not cik:
+        return None
+
+    name = (payload.get("name") or payload.get("entityName") or "").strip() or f"CIK{cik}"
+    entity_type = (payload.get("entityType") or "").strip().lower()
+
+    tickers_raw = payload.get("tickers") or []
+    tickers = sorted({str(t).upper().strip() for t in tickers_raw if str(t).strip()})
+    exchanges_raw = payload.get("exchanges") or []
+    exchanges = sorted({str(x).strip() for x in exchanges_raw if str(x).strip()})
+
+    primary = choose_primary_ticker(tickers)
+    has_companyfacts = bool(find_local_companyfacts_file(cik))
+
+    is_foreign = False
+    try:
+        addresses = payload.get("addresses") or {}
+        mailing = addresses.get("mailing") or {}
+        business = addresses.get("business") or {}
+        is_foreign = bool(mailing.get("isForeignLocation")) or bool(business.get("isForeignLocation"))
+    except Exception:
+        is_foreign = False
+
+    forms = (payload.get("filings") or {}).get("recent", {}).get("form") or []
+    normalized_forms = {_normalize_form_name(f) for f in forms if str(f).strip()}
+    if any(f.startswith(("20-F", "40-F")) or f.startswith("6-K") for f in normalized_forms):
+        is_foreign = True
+
+    is_fund = entity_type not in ("", "operating")
+    if not is_fund:
+        fund_prefixes = ("N-", "NPORT", "N-CEN", "NCSR", "N-CSR")
+        fund_starts = ("485", "497")
+        if any(f.startswith(fund_starts) or f.startswith(fund_prefixes) for f in normalized_forms):
+            is_fund = True
+
+    return {
+        "cik": cik,
+        "name": name,
+        "entity_type": entity_type,
+        "tickers": tickers,
+        "primary_ticker": primary,
+        "exchanges": exchanges,
+        "is_foreign": is_foreign,
+        "is_fund": is_fund,
+        "has_companyfacts": has_companyfacts,
+    }
+
+
+def build_submissions_index(
+    submissions_dir: Path,
+    index_path: Path,
+    status_cb: Optional[Callable[[str], None]] = None,
+) -> None:
+    tmp_path = index_path.with_suffix(index_path.suffix + ".tmp")
+    processed = 0
+    written = 0
+
+    try:
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for path in _iter_cik_json_files(submissions_dir):
+            processed += 1
+            if status_cb and processed % 500 == 0:
+                status_cb(f"Indexing submissions... {processed}")
+            try:
+                with path.open("r", encoding="utf-8") as in_handle:
+                    payload = json.load(in_handle)
+            except Exception:
+                continue
+
+            meta = parse_submissions_metadata(payload)
+            if not meta:
+                continue
+            if not meta.get("tickers"):
+                continue
+            handle.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            written += 1
+
+    tmp_path.replace(index_path)
+    if status_cb:
+        status_cb(f"Index ready: {written} entries")
+
+
+@lru_cache(maxsize=1)
+def load_submissions_index() -> Dict[str, Any]:
+    path = submissions_index_path()
+    if not path.exists():
+        submissions_dir = find_local_submissions_dir()
+        if not submissions_dir:
+            raise EdgarError("submissions folder not found. Put SEC submissions JSONs in ./submissions or set SEC_SUBMISSIONS_DIR.")
+        build_submissions_index(submissions_dir, path)
+
+    entries: List[Dict[str, Any]] = []
+    cik_map: Dict[str, Dict[str, Any]] = {}
+    ticker_map: Dict[str, Dict[str, str]] = {}
+    name_index: Dict[str, str] = {}
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                meta = json.loads(line)
+            except Exception:
+                continue
+            cik = _pad_cik(meta.get("cik") or "")
+            if not cik:
+                continue
+            tickers = meta.get("tickers") or []
+            primary = meta.get("primary_ticker")
+            name = (meta.get("name") or "").strip()
+
+            meta["cik"] = cik
+            entries.append(meta)
+            cik_map[cik] = meta
+
+            for ticker in tickers:
+                t = str(ticker).upper().strip()
+                if not t:
+                    continue
+                ticker_map[t] = {"cik": cik, "title": name or t}
+
+            if name and primary:
+                name_index[normalize_name(name)] = str(primary).upper().strip()
+
+    if not entries:
+        raise EdgarError(f"submissions index is empty: {path}")
+    return {"entries": entries, "cik_map": cik_map, "ticker_map": ticker_map, "name_index": name_index}
+
+
+def ensure_submissions_index(status_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    path = submissions_index_path()
+    if path.exists():
+        return load_submissions_index()
+
+    submissions_dir = find_local_submissions_dir()
+    if not submissions_dir:
+        raise EdgarError("submissions folder not found. Put SEC submissions JSONs in ./submissions or set SEC_SUBMISSIONS_DIR.")
+    build_submissions_index(submissions_dir, path, status_cb=status_cb)
+    load_submissions_index.cache_clear()
+    return load_submissions_index()
+
+
 @lru_cache(maxsize=1)
 def load_edgar_ticker_map() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
     """Load SEC ticker -> CIK mapping and a normalized name index."""
@@ -234,20 +470,61 @@ def load_edgar_ticker_map() -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
 
 
 def resolve_edgar_company(user_text: str) -> Dict[str, str]:
-    """Resolve user input to ticker/CIK/company name using SEC ticker list."""
+    """Resolve user input to ticker/CIK/company name using local submissions index (preferred) or SEC ticker list."""
     if not user_text:
         raise EdgarError("Enter a ticker, CIK, or company name.")
 
     text = user_text.strip()
+    cleaned_ticker = re.sub(r"[^A-Za-z0-9\.-]", "", text).upper()
+    digits = "".join(ch for ch in text if ch.isdigit())
+
+    local = None
+    try:
+        local = load_submissions_index()
+    except Exception:
+        local = None
+
+    if local:
+        ticker_map = local.get("ticker_map", {})
+        cik_map = local.get("cik_map", {})
+        name_index = local.get("name_index", {})
+
+        if cleaned_ticker:
+            info = ticker_map.get(cleaned_ticker)
+            if info and info.get("cik"):
+                return {
+                    "ticker": cleaned_ticker,
+                    "cik": info.get("cik", ""),
+                    "name": info.get("title") or cleaned_ticker,
+                }
+
+        if digits:
+            cik = _pad_cik(digits)
+            meta = cik_map.get(cik)
+            if meta:
+                tickers = meta.get("tickers") or []
+                ticker = meta.get("primary_ticker") or (tickers[0] if tickers else cleaned_ticker or digits)
+                return {"ticker": str(ticker).upper().strip(), "cik": cik, "name": meta.get("name") or text}
+            return {"ticker": cleaned_ticker or digits, "cik": cik, "name": text}
+
+        norm_name = normalize_name(text)
+        if norm_name:
+            direct = name_index.get(norm_name)
+            if direct:
+                info = ticker_map.get(direct, {})
+                return {"ticker": direct, "cik": info.get("cik", ""), "name": info.get("title") or direct}
+            for name_norm, ticker in name_index.items():
+                if norm_name in name_norm or name_norm in norm_name:
+                    info = ticker_map.get(ticker, {})
+                    return {"ticker": ticker, "cik": info.get("cik", ""), "name": info.get("title") or ticker}
+
     ticker_map, name_index = load_edgar_ticker_map()
 
-    cleaned_ticker = re.sub(r"[^A-Za-z0-9\.-]", "", text).upper()
     if cleaned_ticker:
         info = ticker_map.get(cleaned_ticker)
         if info:
             return {"ticker": cleaned_ticker, "cik": info["cik"], "name": info.get("title") or cleaned_ticker}
 
-    digits = "".join(ch for ch in text if ch.isdigit())
     if digits:
         cik = _pad_cik(digits)
         for ticker, info in ticker_map.items():
@@ -357,7 +634,7 @@ def in_range(value: Optional[float], min_value: Optional[float], max_value: Opti
     """Return True if value is within [min, max] when bounds are provided."""
     if value is None:
         # If bounds exist but value is missing, treat as not matching.
-        return not (min_value or max_value)
+        return min_value is None and max_value is None
     if min_value is not None and value < min_value:
         return False
     if max_value is not None and value > max_value:
@@ -696,8 +973,20 @@ def load_company_facts(cik: str) -> Dict:
     if not cik_padded:
         raise EdgarError("CIK is required for EDGAR lookup.")
 
+    local_path = find_local_companyfacts_file(cik_padded)
+    if local_path:
+        try:
+            with local_path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception as exc:
+            raise EdgarError(f"Failed to read local company facts: {local_path}: {exc}") from exc
+
     resp = requests.get(SEC_FACTS_URL.format(cik=cik_padded), headers=sec_headers(), timeout=15)
     if resp.status_code != 200:
+        if resp.status_code == 403:
+            raise EdgarError(
+                "Failed to fetch company facts: HTTP 403. Set SEC_USER_AGENT (contact info) or use local companyfacts data (extract companyfacts.zip into ./companyfacts)."
+            )
         raise EdgarError(f"Failed to fetch company facts: HTTP {resp.status_code}")
     try:
         return resp.json()
@@ -800,33 +1089,91 @@ def _extract_latest_fact_multi(
     return best[2]
 
 
-def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
-    last_error = None
-    try:
-        resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": ticker}, timeout=10)
-        if resp.status_code != 200:
-            raise EdgarError(f"Quote request failed: HTTP {resp.status_code}")
-        try:
-            result = resp.json().get("quoteResponse", {}).get("result", [])
-        except Exception as exc:
-            raise EdgarError(f"Invalid quote response: {exc}") from exc
+def yahoo_symbol_for_ticker(ticker: str) -> str:
+    symbol = (ticker or "").strip().upper()
+    if "." in symbol and "-" not in symbol:
+        return symbol.replace(".", "-")
+    return symbol
 
-        if not result:
-            raise EdgarError("Quote not found for ticker.")
-        entry = result[0]
-        return {
+
+def fetch_yahoo_quotes_batch(tickers: List[str], *, max_retries: int = 3) -> Dict[str, Dict[str, Optional[float]]]:
+    symbols = [yahoo_symbol_for_ticker(t) for t in (tickers or []) if str(t).strip()]
+    if not symbols:
+        return {}
+
+    last_status = None
+    for attempt in range(max_retries + 1):
+        resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": ",".join(symbols)}, timeout=10)
+        last_status = resp.status_code
+        if resp.status_code == 200:
+            break
+        if resp.status_code in (429, 500, 502, 503, 504):
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait_sec = int(float(retry_after)) if retry_after else 0
+            except Exception:
+                wait_sec = 0
+            if wait_sec <= 0:
+                wait_sec = min(30, 2 ** attempt)
+            time.sleep(wait_sec)
+            continue
+        raise EdgarError(f"Quote request failed: HTTP {resp.status_code}")
+
+    if resp.status_code != 200:
+        raise EdgarError(f"Quote request failed: HTTP {last_status}")
+
+    try:
+        result = resp.json().get("quoteResponse", {}).get("result", [])
+    except Exception as exc:
+        raise EdgarError(f"Invalid quote response: {exc}") from exc
+
+    quotes: Dict[str, Dict[str, Optional[float]]] = {}
+    for entry in result or []:
+        symbol = str(entry.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        quotes[symbol] = {
             "price": entry.get("regularMarketPrice"),
             "per": entry.get("trailingPE"),
             "pbr": entry.get("priceToBook"),
             "currency": entry.get("currency"),
             "source": "yahoo",
         }
-    except Exception as exc:
-        last_error = str(exc)
+    return quotes
+
+
+def fetch_yahoo_quote(ticker: str) -> Dict[str, Optional[float]]:
+    last_error = None
+    for symbol in (ticker, yahoo_symbol_for_ticker(ticker)):
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            continue
+        try:
+            resp = requests.get(YAHOO_QUOTE_URL, params={"symbols": symbol}, timeout=10)
+            if resp.status_code != 200:
+                raise EdgarError(f"Quote request failed: HTTP {resp.status_code}")
+            try:
+                result = resp.json().get("quoteResponse", {}).get("result", [])
+            except Exception as exc:
+                raise EdgarError(f"Invalid quote response: {exc}") from exc
+
+            if not result:
+                raise EdgarError("Quote not found for ticker.")
+            entry = result[0]
+            return {
+                "price": entry.get("regularMarketPrice"),
+                "per": entry.get("trailingPE"),
+                "pbr": entry.get("priceToBook"),
+                "currency": entry.get("currency"),
+                "source": "yahoo",
+            }
+        except Exception as exc:
+            last_error = str(exc)
 
     return fetch_stooq_quote(ticker, last_error)
 
 
+@lru_cache(maxsize=1)
 def fetch_usdkrw_rate() -> Optional[float]:
     """Fetch USD/KRW on each lookup with optional .env override fallback."""
     env_rate = parse_float(os.getenv("USD_KRW_RATE"))
@@ -865,7 +1212,7 @@ def fetch_usdkrw_rate() -> Optional[float]:
 
 
 def fetch_stooq_quote(ticker: str, yahoo_error: Optional[str] = None) -> Dict[str, Optional[float]]:
-    symbol = f"{ticker.lower()}.us"
+    symbol = f"{yahoo_symbol_for_ticker(ticker).lower()}.us"
     resp = requests.get(STOOQ_QUOTE_URL, params={"s": symbol, "i": "d"}, timeout=10)
     if resp.status_code != 200:
         raise EdgarError(
@@ -1100,6 +1447,125 @@ class KisClient:
         return snapshot
 
 
+def extract_edgar_scan_fundamentals(facts: Dict) -> Dict[str, Any]:
+    """Extract EDGAR fundamentals needed for US range scanning (no quote-dependent metrics)."""
+
+    def pick_fact(tags) -> Optional[int]:
+        for tag in tags:
+            val = _extract_latest_fact(facts, tag)
+            if val is not None:
+                return _parse_int(val)
+        return None
+
+    cash_val = pick_fact(("CashAndCashEquivalentsAtCarryingValue",))
+    current_marketable = pick_fact(("MarketableSecuritiesCurrent", "ShortTermInvestments"))
+    noncurrent_marketable = pick_fact(
+        (
+            "MarketableSecuritiesNoncurrent",
+            "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+            "LongTermInvestments",
+            "LongTermMarketableSecurities",
+            "OtherInvestmentsNoncurrent",
+        )
+    )
+    liquid_funds_total = _sum_or_none([cash_val, current_marketable, noncurrent_marketable])
+
+    debt_current_base = pick_fact(
+        (
+            "DebtCurrent",
+            "LongTermDebtCurrent",
+            "CurrentPortionOfLongTermDebt",
+            "CurrentPortionOfLongTermDebtAndCapitalLeaseObligations",
+            "ShortTermBorrowings",
+        )
+    )
+    commercial_paper_val = _parse_int(_extract_latest_fact(facts, "CommercialPaper"))
+    debt_noncurrent = pick_fact(
+        (
+            "LongTermDebtNoncurrent",
+            "DebtNoncurrent",
+            "LongTermBorrowings",
+            "LongTermLoansPayable",
+            "LongTermNotesPayable",
+            "LongTermConvertibleDebt",
+        )
+    )
+    debt_total_only = pick_fact(
+        (
+            "LongTermDebt",
+            "DebtAndCapitalLeaseObligations",
+            "LongTermDebtAndCapitalLeaseObligations",
+        )
+    )
+
+    current_debt_total = None
+    if debt_current_base is None:
+        current_debt_total = commercial_paper_val
+    elif commercial_paper_val is None:
+        current_debt_total = debt_current_base
+    else:
+        try:
+            rel_diff = abs(debt_current_base - commercial_paper_val) / max(debt_current_base, commercial_paper_val)
+        except Exception:
+            rel_diff = 0
+        if rel_diff <= 0.01:
+            current_debt_total = max(debt_current_base, commercial_paper_val)
+        else:
+            current_debt_total = debt_current_base + commercial_paper_val
+
+    total_debt = None
+    if current_debt_total is not None or debt_noncurrent is not None:
+        total_debt = _sum_or_none([current_debt_total, debt_noncurrent])
+    elif debt_total_only is not None:
+        total_debt = debt_total_only
+
+    net_cash, debt_value = compute_net_cash(
+        liquid_funds_total, total_debt, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
+    )
+
+    shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
+    net_income = _parse_int(_extract_latest_fact(facts, "NetIncomeLoss"))
+    equity = _parse_int(
+        _extract_latest_fact(facts, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
+        or _extract_latest_fact(facts, "StockholdersEquity")
+    )
+    liabilities = _parse_int(_extract_latest_fact(facts, "Liabilities"))
+
+    liabilities_ratio_value = None
+    if liabilities is not None and equity not in (None, 0):
+        try:
+            liabilities_ratio_value = (liabilities / equity) * 100
+        except Exception:
+            liabilities_ratio_value = None
+
+    interest_bearing_ratio_value = None
+    if debt_value is not None and equity not in (None, 0):
+        try:
+            interest_bearing_ratio_value = (debt_value / equity) * 100
+        except Exception:
+            interest_bearing_ratio_value = None
+
+    net_cash_per_share_value = None
+    if net_cash is not None and shares:
+        try:
+            net_cash_per_share_value = net_cash / shares
+        except Exception:
+            net_cash_per_share_value = None
+
+    return {
+        "liquid_funds_total": liquid_funds_total,
+        "interest_bearing_debt": debt_value,
+        "net_cash": net_cash,
+        "shares": shares,
+        "net_income": net_income,
+        "equity": equity,
+        "liabilities": liabilities,
+        "liabilities_ratio_value": liabilities_ratio_value,
+        "interest_bearing_debt_ratio_value": interest_bearing_ratio_value,
+        "net_cash_per_share_value": net_cash_per_share_value,
+    }
+
+
 def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str]]:
     company = resolve_edgar_company(user_text)
     ticker = company.get("ticker") or user_text
@@ -1242,6 +1708,15 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         except Exception:
             pbr_val = None
 
+    liabilities = _parse_int(_extract_latest_fact(facts, "Liabilities"))
+    liabilities_ratio_pct = None
+    if liabilities is not None and equity not in (None, 0):
+        try:
+            liabilities_ratio_pct = (liabilities / equity) * 100
+        except Exception:
+            liabilities_ratio_pct = None
+    liabilities_ratio_text = f"{liabilities_ratio_pct:,.2f}" if liabilities_ratio_pct is not None else "N/A"
+
     debt_ratio_pct = None
     if debt_value is not None and equity not in (None, 0):
         try:
@@ -1273,7 +1748,7 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         per=clean_number(per_val) if per_val is not None else "N/A",
         pbr=clean_number(pbr_val) if pbr_val is not None else "N/A",
         cash=format_amount(liquid_funds_total) if liquid_funds_total is not None else "N/A",
-        debt_ratio=debt_ratio_text,
+        debt_ratio=liabilities_ratio_text,
         listed_shares=shares,
         net_cash_per_share_ratio=net_cash_per_share_ratio,
     )
@@ -1300,9 +1775,12 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "float_shares_display": format_amount(shares) if shares is not None else None,
         "net_cash_per_share": net_cash_per_share,
         "net_cash_per_share_ratio": net_cash_per_share_ratio,
+        "liabilities_ratio_value": liabilities_ratio_pct,
+        "interest_bearing_debt_ratio": debt_ratio_text,
+        "interest_bearing_debt_ratio_value": debt_ratio_pct,
         "quote_source": quote_source,
         "quote_error": quote_error,
-        "debt_ratio": debt_ratio_text,
+        "debt_ratio": liabilities_ratio_text,
         "usd_krw_rate": usdkrw_rate,
         "edgar_liquid_breakdown": {
             "cash_and_equivalents": cash_val,
@@ -1466,7 +1944,7 @@ def build_gui():
     per_var = tk.StringVar(value="-")
     pbr_var = tk.StringVar(value="-")
     debt_var = tk.StringVar(value="-")
-    debt_label_var = tk.StringVar(value="Debt/Equity (EDGAR, %)")
+    debt_label_var = tk.StringVar(value="Liabilities/Equity (EDGAR, %)")
     dart_year_var = tk.StringVar(value="-")
     dart_net_cash_ps_var = tk.StringVar(value="-")
     dart_net_cash_ps_ratio_var = tk.StringVar(value="-")
@@ -1475,11 +1953,9 @@ def build_gui():
     dart_equity_var = tk.StringVar(value="-")
 
     def open_scan_modal():
-        if country_var.get() != "KR":
-            messagebox.showinfo("Range Scan", "Range Scan is available for Korea (KR) only.")
-            return
+        selected_country = country_var.get()
         modal = tk.Toplevel(root)
-        modal.title("Range Scan")
+        modal.title(f"Range Scan ({selected_country})")
         modal.geometry("720x520")
         modal.resizable(True, True)
 
@@ -1504,11 +1980,16 @@ def build_gui():
             ttk.Label(controls, text="~").grid(row=row, column=2, sticky="w")
             ttk.Entry(controls, textvariable=max_var, width=10).grid(row=row, column=3, sticky="w", padx=(4, 12))
 
+        debt_label = "부채비율(KIS)" if selected_country == "KR" else "Liabilities/Equity (EDGAR, %)"
+        ib_label = "이자부채/자본(%)" if selected_country == "KR" else "Interest-bearing debt/Equity (EDGAR, %)"
+        ncs_label = "주당 순현금/주가(%)" if selected_country == "KR" else "Net cash/share ÷ Price (%)"
+        ncs_col_label = "주당순현금/주가" if selected_country == "KR" else "Net cash/share ÷ Price"
+
         add_field(0, "PER", per_min_var, per_max_var)
         add_field(1, "PBR", pbr_min_var, pbr_max_var)
-        add_field(2, "부채비율(KIS)", debt_min_var, debt_max_var)
-        add_field(3, "이자부채/자본(%)", ib_debt_min_var, ib_debt_max_var)
-        add_field(4, "주당 순현금/주가(%)", ncs_ratio_min_var, ncs_ratio_max_var)
+        add_field(2, debt_label, debt_min_var, debt_max_var)
+        add_field(3, ib_label, ib_debt_min_var, ib_debt_max_var)
+        add_field(4, ncs_label, ncs_ratio_min_var, ncs_ratio_max_var)
 
         ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=4, rowspan=3, padx=4)
         ttk.Button(controls, text="Close", command=modal.destroy).grid(row=3, column=4, rowspan=2, padx=4)
@@ -1520,8 +2001,8 @@ def build_gui():
             ("code", "Code", 80),
             ("per", "PER", 80),
             ("pbr", "PBR", 80),
-            ("debt", "부채비율(KIS)", 110),
-            ("net_cash_ratio", "주당순현금/주가", 140),
+            ("debt", debt_label, 110),
+            ("net_cash_ratio", ncs_col_label, 140),
         ):
             tree.heading(col, text=text)
             tree.column(col, width=width, anchor="center")
@@ -1561,6 +2042,169 @@ def build_gui():
                         pass
 
                 try:
+                    if selected_country != "KR":
+                        index = ensure_submissions_index(status_cb=set_scan_status)
+                        entries = index.get("entries", []) if isinstance(index, dict) else []
+                        targets = []
+                        for meta in entries:
+                            try:
+                                if meta.get("is_foreign") or meta.get("is_fund"):
+                                    continue
+                                if not meta.get("has_companyfacts"):
+                                    continue
+                                ticker = (meta.get("primary_ticker") or "").strip().upper()
+                                cik = meta.get("cik")
+                                if not ticker or not cik:
+                                    continue
+                                targets.append(
+                                    {
+                                        "ticker": ticker,
+                                        "cik": cik,
+                                        "name": (meta.get("name") or ticker).strip(),
+                                    }
+                                )
+                            except Exception:
+                                continue
+
+                        total = len(targets)
+                        if not total:
+                            set_scan_status("No US targets found (check submissions/companyfacts filters).")
+                            return
+
+                        set_scan_status(f"Loading fundamentals... 0/{total}")
+                        candidates = []
+                        processed = 0
+                        matched = 0
+                        last_error = None
+
+                        for item in targets:
+                            processed += 1
+                            try:
+                                facts = load_company_facts(item["cik"])
+                                fundamentals = extract_edgar_scan_fundamentals(facts)
+                                liabilities_ratio_val = fundamentals.get("liabilities_ratio_value")
+                                ib_ratio_val = fundamentals.get("interest_bearing_debt_ratio_value")
+                                if not (
+                                    in_range(liabilities_ratio_val, debt_min, debt_max)
+                                    and in_range(ib_ratio_val, ib_debt_min, ib_debt_max)
+                                ):
+                                    continue
+                                fundamentals["ticker"] = item["ticker"]
+                                fundamentals["cik"] = item["cik"]
+                                fundamentals["name"] = item["name"]
+                                candidates.append(fundamentals)
+                            except Exception as exc:
+                                last_error = str(exc)
+                            if processed % 200 == 0 or processed == total:
+                                set_scan_status(
+                                    f"Loading fundamentals... {processed}/{total}, candidates {len(candidates)}"
+                                )
+
+                        total_quotes = len(candidates)
+                        if not total_quotes:
+                            set_scan_status("No candidates after fundamentals filters.")
+                            return
+
+                        set_scan_status(f"Fetching quotes... 0/{total_quotes}")
+                        chunk_size = 100
+                        processed_quotes = 0
+                        use_yahoo = os.getenv("US_RANGE_SCAN_QUOTE_SOURCE", "").lower() != "stooq"
+                        for offset in range(0, total_quotes, chunk_size):
+                            chunk = candidates[offset : offset + chunk_size]
+                            yahoo_symbols = [yahoo_symbol_for_ticker(c.get("ticker", "")) for c in chunk]
+                            quotes = {}
+                            if use_yahoo:
+                                try:
+                                    quotes = fetch_yahoo_quotes_batch(yahoo_symbols)
+                                except Exception as exc:
+                                    last_error = str(exc)
+                                    if "HTTP 429" in last_error:
+                                        use_yahoo = False
+                                        set_scan_status("Yahoo rate-limited; switching to Stooq-only quotes...")
+                                    quotes = {}
+
+                            for cand in chunk:
+                                processed_quotes += 1
+                                try:
+                                    ticker = cand.get("ticker", "")
+                                    symbol = yahoo_symbol_for_ticker(ticker)
+                                    quote = quotes.get(symbol)
+                                    if not quote:
+                                        quote = fetch_stooq_quote(ticker)
+
+                                    price_val = quote.get("price")
+                                    per_val = quote.get("per")
+                                    pbr_val = quote.get("pbr")
+                                    market_price = float(price_val) if price_val is not None else None
+
+                                    shares = cand.get("shares")
+                                    market_cap = market_price * shares if market_price is not None and shares else None
+                                    net_income = cand.get("net_income")
+                                    equity = cand.get("equity")
+
+                                    if per_val is None and market_cap is not None and net_income not in (None, 0):
+                                        try:
+                                            per_val = market_cap / net_income
+                                        except Exception:
+                                            per_val = None
+                                    if pbr_val is None and market_cap is not None and equity not in (None, 0):
+                                        try:
+                                            pbr_val = market_cap / equity
+                                        except Exception:
+                                            pbr_val = None
+
+                                    net_cash_ps_val = cand.get("net_cash_per_share_value")
+                                    net_cash_ratio_val = None
+                                    net_cash_ratio_text = "N/A"
+                                    if net_cash_ps_val is not None and market_price and market_price > 0:
+                                        try:
+                                            ratio = (net_cash_ps_val / market_price) * 100
+                                            net_cash_ratio_val = ratio
+                                            net_cash_ratio_text = f"{ratio:,.2f}%"
+                                        except Exception:
+                                            net_cash_ratio_val = None
+                                            net_cash_ratio_text = "N/A"
+
+                                    liabilities_ratio_val = cand.get("liabilities_ratio_value")
+                                    ib_ratio_val = cand.get("interest_bearing_debt_ratio_value")
+                                    if not (
+                                        in_range(per_val, per_min, per_max)
+                                        and in_range(pbr_val, pbr_min, pbr_max)
+                                        and in_range(liabilities_ratio_val, debt_min, debt_max)
+                                        and in_range(net_cash_ratio_val, ncsr_min, ncsr_max)
+                                        and in_range(ib_ratio_val, ib_debt_min, ib_debt_max)
+                                    ):
+                                        continue
+
+                                    matched += 1
+                                    liabilities_ratio_text = (
+                                        f"{liabilities_ratio_val:,.2f}" if liabilities_ratio_val is not None else "N/A"
+                                    )
+                                    values = (
+                                        cand.get("name") or "N/A",
+                                        ticker,
+                                        clean_number(per_val) if per_val is not None else "N/A",
+                                        clean_number(pbr_val) if pbr_val is not None else "N/A",
+                                        liabilities_ratio_text,
+                                        net_cash_ratio_text,
+                                    )
+                                    root.after(0, lambda vals=values: tree.insert("", "end", values=vals))
+                                except Exception as exc:
+                                    last_error = str(exc)
+
+                            if processed_quotes % 200 == 0 or processed_quotes == total_quotes:
+                                set_scan_status(
+                                    f"Scanning... {processed_quotes}/{total_quotes}, matched {matched}"
+                                )
+
+                        if last_error:
+                            set_scan_status(
+                                f"완료: {matched}개 매치 / {total_quotes}개 처리 (마지막 오류: {last_error})"
+                            )
+                        else:
+                            set_scan_status(f"완료: {matched}개 매치 / {total_quotes}개 처리")
+                        return
+
                     app_key = os.getenv("KIS_APP_KEY")
                     app_secret = os.getenv("KIS_APP_SECRET")
                     base_url = os.getenv("KIS_BASE_URL")
@@ -1787,8 +2431,8 @@ def build_gui():
             scan_button.state(["!disabled"])
             debt_label_var.set("부채비율(KIS)")
         else:
-            scan_button.state(["disabled"])
-            debt_label_var.set("Debt/Equity (EDGAR, %)")
+            scan_button.state(["!disabled"])
+            debt_label_var.set("Liabilities/Equity (EDGAR, %)")
 
     country_combo.bind("<<ComboboxSelected>>", update_controls_for_country)
     update_controls_for_country()
