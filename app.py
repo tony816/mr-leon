@@ -1945,6 +1945,8 @@ def build_gui():
     pbr_var = tk.StringVar(value="-")
     debt_var = tk.StringVar(value="-")
     debt_label_var = tk.StringVar(value="Liabilities/Equity (EDGAR, %)")
+    ib_debt_var = tk.StringVar(value="-")
+    ib_debt_label_var = tk.StringVar(value="Interest-bearing debt/Equity (EDGAR, %)")
     dart_year_var = tk.StringVar(value="-")
     dart_net_cash_ps_var = tk.StringVar(value="-")
     dart_net_cash_ps_ratio_var = tk.StringVar(value="-")
@@ -1969,16 +1971,39 @@ def build_gui():
         ib_debt_max_var = tk.StringVar()
         ncs_ratio_min_var = tk.StringVar()
         ncs_ratio_max_var = tk.StringVar()
-        scan_status_var = tk.StringVar(value="범위를 입력 후 Scan을 눌러주세요.")
+        scan_status_var = tk.StringVar(value="범위를 입력하거나 All을 체크 후 Scan을 눌러주세요.")
 
         controls = ttk.Frame(modal, padding=(8, 8))
         controls.pack(fill="x")
 
         def add_field(row, label, min_var, max_var):
             ttk.Label(controls, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(controls, textvariable=min_var, width=10).grid(row=row, column=1, sticky="w", padx=(4, 8))
+            min_entry = ttk.Entry(controls, textvariable=min_var, width=10)
+            min_entry.grid(row=row, column=1, sticky="w", padx=(4, 8))
             ttk.Label(controls, text="~").grid(row=row, column=2, sticky="w")
-            ttk.Entry(controls, textvariable=max_var, width=10).grid(row=row, column=3, sticky="w", padx=(4, 12))
+            max_entry = ttk.Entry(controls, textvariable=max_var, width=10)
+            max_entry.grid(row=row, column=3, sticky="w", padx=(4, 12))
+
+            all_var = tk.BooleanVar(value=False)
+            prev = {"min": "", "max": ""}
+
+            def toggle_all():
+                if all_var.get():
+                    prev["min"] = min_var.get()
+                    prev["max"] = max_var.get()
+                    min_var.set("all")
+                    max_var.set("all")
+                    min_entry.configure(state="disabled")
+                    max_entry.configure(state="disabled")
+                else:
+                    restore_min = prev.get("min", "")
+                    restore_max = prev.get("max", "")
+                    min_var.set("" if str(restore_min).strip().lower() == "all" else restore_min)
+                    max_var.set("" if str(restore_max).strip().lower() == "all" else restore_max)
+                    min_entry.configure(state="normal")
+                    max_entry.configure(state="normal")
+
+            ttk.Checkbutton(controls, text="All", variable=all_var, command=toggle_all).grid(row=row, column=4, sticky="w")
 
         debt_label = "부채비율(KIS)" if selected_country == "KR" else "Liabilities/Equity (EDGAR, %)"
         ib_label = "이자부채/자본(%)" if selected_country == "KR" else "Interest-bearing debt/Equity (EDGAR, %)"
@@ -1991,8 +2016,8 @@ def build_gui():
         add_field(3, ib_label, ib_debt_min_var, ib_debt_max_var)
         add_field(4, ncs_label, ncs_ratio_min_var, ncs_ratio_max_var)
 
-        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=4, rowspan=3, padx=4)
-        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=3, column=4, rowspan=2, padx=4)
+        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=5, rowspan=3, padx=4)
+        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=3, column=5, rowspan=2, padx=4)
 
         columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio")
         tree = ttk.Treeview(modal, columns=columns, show="headings", height=16)
@@ -2287,16 +2312,14 @@ def build_gui():
 
     def update_view(snapshot: PriceSnapshot, dart_data=None):
         debt_display = snapshot.debt_ratio
+        ib_ratio_display = "-"
         try:
             if dart_data:
                 ib_ratio = dart_data.get("interest_bearing_debt_ratio")
                 if ib_ratio not in (None, "N/A", ""):
-                    if debt_display not in (None, "N/A", ""):
-                        debt_display = f"{debt_display} (D/E ib: {ib_ratio}%)"
-                    else:
-                        debt_display = f"D/E ib: {ib_ratio}%"
+                    ib_ratio_display = f"{ib_ratio}%"
         except Exception:
-            debt_display = snapshot.debt_ratio
+            ib_ratio_display = "-"
         try:
             root.after(
                 0,
@@ -2306,6 +2329,7 @@ def build_gui():
                     per_var.set(snapshot.per),
                     pbr_var.set(snapshot.pbr),
                     debt_var.set(debt_display),
+                    ib_debt_var.set(ib_ratio_display),
                 ),
             )
         except Exception:
@@ -2430,9 +2454,11 @@ def build_gui():
         if country_var.get() == "KR":
             scan_button.state(["!disabled"])
             debt_label_var.set("부채비율(KIS)")
+            ib_debt_label_var.set("Interest-bearing debt/Equity (DART, %)")
         else:
             scan_button.state(["!disabled"])
             debt_label_var.set("Liabilities/Equity (EDGAR, %)")
+            ib_debt_label_var.set("Interest-bearing debt/Equity (EDGAR, %)")
 
     country_combo.bind("<<ComboboxSelected>>", update_controls_for_country)
     update_controls_for_country()
@@ -2455,12 +2481,14 @@ def build_gui():
     add_row("PBR", pbr_var, 3)
     ttk.Label(info_frame, textvariable=debt_label_var, width=12).grid(row=4, column=0, sticky="w", pady=2)
     ttk.Label(info_frame, textvariable=debt_var, width=32).grid(row=4, column=1, sticky="w", pady=2)
-    add_row("사업연도(DART)", dart_year_var, 5)
-    add_row("주당 순현금", dart_net_cash_ps_var, 6)
-    add_row("주당 순현금/주가", dart_net_cash_ps_ratio_var, 7)
-    add_row("매출액", dart_sales_var, 8)
-    add_row("영업이익", dart_op_var, 9)
-    add_row("자본총계", dart_equity_var, 10)
+    ttk.Label(info_frame, textvariable=ib_debt_label_var, width=12).grid(row=5, column=0, sticky="w", pady=2)
+    ttk.Label(info_frame, textvariable=ib_debt_var, width=32).grid(row=5, column=1, sticky="w", pady=2)
+    add_row("사업연도(DART)", dart_year_var, 6)
+    add_row("주당 순현금", dart_net_cash_ps_var, 7)
+    add_row("주당 순현금/주가", dart_net_cash_ps_ratio_var, 8)
+    add_row("매출액", dart_sales_var, 9)
+    add_row("영업이익", dart_op_var, 10)
+    add_row("자본총계", dart_equity_var, 11)
 
     status_bar = ttk.Label(root, textvariable=status_var, anchor="w", relief="sunken")
     status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
