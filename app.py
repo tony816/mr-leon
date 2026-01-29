@@ -693,6 +693,66 @@ def fetch_dart_single_accounts(corp_code: str, bsns_year: str, reprt_code: str):
     return payload.get("list") or []
 
 
+def _fetch_dart_annual_values(
+    corp_code: str, bsns_year: str
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    params = {
+        "crtfc_key": get_dart_key(),
+        "corp_code": corp_code,
+        "bsns_year": bsns_year,
+        "reprt_code": "11011",
+    }
+    resp = requests.get(DART_MULTI_ACNT_URL, params=params, timeout=15)
+    if resp.status_code != 200:
+        return None, None
+    payload = resp.json()
+    if payload.get("status") != "000":
+        return None, None
+    entries = payload.get("list") or []
+    if not entries:
+        return None, None
+    single_entries = []
+    try:
+        single_entries = fetch_dart_single_accounts(corp_code, bsns_year, "11011")
+    except Exception:
+        single_entries = []
+    combined = (single_entries or []) + (entries or [])
+    revenue_val = find_account_amount(combined, "매출액")
+    op_income_val = find_account_amount(combined, "영업이익")
+    net_income_val = find_account_amount(combined, "당기순이익")
+    return revenue_val, op_income_val, net_income_val
+
+
+def collect_dart_annual_series(
+    corp_code: str, window_years: int = 5
+) -> Tuple[Dict[int, Optional[int]], Dict[int, Optional[int]], Dict[int, Optional[int]]]:
+    today = datetime.date.today()
+    current_year = today.year
+    target_years: List[int] = []
+    for year in range(current_year, current_year - 12, -1):
+        release_date = datetime.date(year + 1, 3, 1)
+        if release_date > today:
+            continue
+        target_years.append(year)
+        if len(target_years) >= window_years + 1:
+            break
+
+    revenue_by_year: Dict[int, Optional[int]] = {year: None for year in target_years}
+    op_by_year: Dict[int, Optional[int]] = {year: None for year in target_years}
+    net_by_year: Dict[int, Optional[int]] = {year: None for year in target_years}
+
+    for year in target_years:
+        try:
+            revenue_val, op_income_val, net_income_val = _fetch_dart_annual_values(corp_code, str(year))
+        except Exception:
+            continue
+        revenue_by_year[year] = revenue_val
+        op_by_year[year] = op_income_val
+        net_by_year[year] = net_income_val
+
+    return revenue_by_year, op_by_year, net_by_year
+
+
 def _parse_int(value) -> Optional[int]:
     try:
         return int(float(str(value).replace(",", "")))
@@ -836,6 +896,16 @@ def fetch_dart_financials(
     """
     corp_code, corp_name = resolve_dart_corp(user_text)
     now_year = time.localtime().tm_year
+    sales_growth_5y = "N/A"
+    op_growth_5y = "N/A"
+    net_income_growth_5y = "N/A"
+    try:
+        revenue_series, op_series, net_series = collect_dart_annual_series(corp_code, window_years=5)
+        sales_growth_5y = format_yoy_average(revenue_series, window_years=5)
+        op_growth_5y = format_yoy_average(op_series, window_years=5)
+        net_income_growth_5y = format_yoy_average(net_series, window_years=5)
+    except Exception:
+        pass
     if reprt_code:
         years_to_try = [str(bsns_year)] if bsns_year else [str(now_year - i) for i in range(4)]
         periods = [(year, reprt_code) for year in years_to_try]
@@ -949,6 +1019,9 @@ def fetch_dart_financials(
             "bsns_year": year,
             "reprt_code": report_code,
             "summary": summary,
+            "sales_growth_5y": sales_growth_5y,
+            "op_growth_5y": op_growth_5y,
+            "net_income_growth_5y": net_income_growth_5y,
             "cash_equivalents": format_amount(cash_equivalents) if cash_equivalents is not None else "N/A",
             "liquid_funds": liquid_funds,
             "interest_bearing_debt": debt_value,
@@ -1087,6 +1160,121 @@ def _extract_latest_fact_multi(
         return None
     best = min(candidates, key=lambda c: (c[0], -c[1]))
     return best[2]
+
+
+def _coerce_year(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def _year_from_iso_date(date_text: str) -> Optional[int]:
+    try:
+        return datetime.date.fromisoformat(date_text).year
+    except Exception:
+        return None
+
+
+def _extract_annual_series(
+    facts: Dict,
+    keys,
+    units=("USD",),
+    forms_priority=SEC_FORM_PRIORITY,
+) -> Dict[int, float]:
+    facts_root = (facts or {}).get("facts", {}).get("us-gaap", {})
+    priority_map = {form: idx for idx, form in enumerate(forms_priority)}
+    key_priority = {key: idx for idx, key in enumerate(keys)}
+    today_ord = datetime.date.today().toordinal()
+    per_year: Dict[int, Tuple[int, int, int, float]] = {}
+
+    for key in keys:
+        entry = facts_root.get(key) or {}
+        unit_map = entry.get("units") or {}
+        for unit in units:
+            for item in unit_map.get(unit, []):
+                val = item.get("val")
+                if val in (None, "", "-", "NaN"):
+                    continue
+                try:
+                    val_num = float(val)
+                except Exception:
+                    continue
+                fp = item.get("fp")
+                if fp and fp != "FY":
+                    continue
+                end_ts = _parse_iso_date(item.get("end") or "") or _parse_iso_date(item.get("filed") or "")
+                if end_ts and end_ts > today_ord:
+                    continue
+                year = _coerce_year(item.get("fy")) or _year_from_iso_date(item.get("end") or "")
+                if not year:
+                    continue
+                form = item.get("form", "")
+                priority = priority_map.get(form, len(forms_priority))
+                key_rank = key_priority.get(key, len(keys))
+                candidate = (priority, key_rank, end_ts, val_num)
+                existing = per_year.get(year)
+                if existing is None:
+                    per_year[year] = candidate
+                    continue
+                if candidate[0] < existing[0]:
+                    per_year[year] = candidate
+                elif candidate[0] == existing[0]:
+                    if candidate[1] < existing[1]:
+                        per_year[year] = candidate
+                    elif candidate[1] == existing[1] and candidate[2] > existing[2]:
+                        per_year[year] = candidate
+
+    return {year: data[3] for year, data in per_year.items()}
+
+
+def _build_recent_year_window(
+    values_by_year: Dict[int, Optional[float]], window_years: int
+) -> List[Tuple[int, Optional[float]]]:
+    if not values_by_year:
+        return []
+    valid_years = [year for year, value in values_by_year.items() if value is not None]
+    if not valid_years:
+        return []
+    max_year = max(valid_years)
+    start_year = max_year - window_years
+    return [(year, values_by_year.get(year)) for year in range(start_year, max_year + 1)]
+
+
+def format_yoy_average(values_by_year: Dict[int, Optional[float]], window_years: int = 5) -> str:
+    series = _build_recent_year_window(values_by_year, window_years)
+    if len(series) < 2:
+        return "N/A"
+    positive_rates: List[float] = []
+    transitions: List[str] = []
+    for (prev_year, prev_val), (curr_year, curr_val) in zip(series, series[1:]):
+        if prev_val is None or curr_val is None:
+            continue
+        if prev_val > 0 and curr_val > 0:
+            try:
+                positive_rates.append((curr_val - prev_val) / prev_val)
+            except Exception:
+                continue
+        else:
+            if prev_val <= 0 and curr_val > 0:
+                transitions.append(f"적자→흑자 {prev_year}→{curr_year}")
+            elif prev_val > 0 and curr_val <= 0:
+                transitions.append(f"흑자→적자 {prev_year}→{curr_year}")
+
+    parts = []
+    if positive_rates:
+        avg_rate = sum(positive_rates) / len(positive_rates)
+        avg_text = f"{avg_rate * 100:,.2f}%"
+        parts.append(f"양(+) 구간 {len(positive_rates)}개 평균")
+    else:
+        avg_text = "N/A"
+        parts.append("양(+) 구간 없음")
+    if transitions:
+        parts.append(f"특이: {', '.join(transitions)}")
+    suffix = "; ".join(parts)
+    return f"{avg_text} ({suffix})" if suffix else avg_text
 
 
 def yahoo_symbol_for_ticker(ticker: str) -> str:
@@ -1678,6 +1866,18 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         _extract_latest_fact(facts, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")
         or _extract_latest_fact(facts, "StockholdersEquity")
     )
+    sales_growth_5y = "N/A"
+    op_growth_5y = "N/A"
+    net_income_growth_5y = "N/A"
+    try:
+        revenue_series = _extract_annual_series(facts, revenue_keys)
+        op_income_series = _extract_annual_series(facts, ("OperatingIncomeLoss",))
+        net_income_series = _extract_annual_series(facts, ("NetIncomeLoss",))
+        sales_growth_5y = format_yoy_average(revenue_series, window_years=5)
+        op_growth_5y = format_yoy_average(op_income_series, window_years=5)
+        net_income_growth_5y = format_yoy_average(net_income_series, window_years=5)
+    except Exception:
+        pass
     usdkrw_rate = fetch_usdkrw_rate()
 
     quote = {}
@@ -1765,6 +1965,9 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "cik": cik,
         "bsns_year": "-",  # EDGAR facts API is period-agnostic; surface aggregate only.
         "summary": detail_summary,
+        "sales_growth_5y": sales_growth_5y,
+        "op_growth_5y": op_growth_5y,
+        "net_income_growth_5y": net_income_growth_5y,
         "liquid_funds_total": liquid_funds_total,
         "liquid_funds_current": liquid_funds_current,
         "liquid_funds_noncurrent": noncurrent_marketable,
@@ -1924,7 +2127,7 @@ def build_gui():
 
     root = tk.Tk()
     root.title("KIS/DART/EDGAR Viewer")
-    root.geometry("640x430")
+    root.geometry("640x490")
     root.resizable(False, False)
 
     root.configure(padx=14, pady=12, bg="#f7f7f7")
@@ -1952,6 +2155,9 @@ def build_gui():
     dart_net_cash_ps_ratio_var = tk.StringVar(value="-")
     dart_sales_var = tk.StringVar(value="-")
     dart_op_var = tk.StringVar(value="-")
+    dart_sales_growth_var = tk.StringVar(value="-")
+    dart_op_growth_var = tk.StringVar(value="-")
+    dart_net_income_growth_var = tk.StringVar(value="-")
     dart_equity_var = tk.StringVar(value="-")
 
     def open_scan_modal():
@@ -2345,6 +2551,9 @@ def build_gui():
                         dart_net_cash_ps_ratio_var.set(dart_data.get("net_cash_per_share_ratio", "N/A")),
                         dart_sales_var.set(summary.get("매출액", "N/A")),
                         dart_op_var.set(summary.get("영업이익", "N/A")),
+                        dart_sales_growth_var.set(dart_data.get("sales_growth_5y", "N/A")),
+                        dart_op_growth_var.set(dart_data.get("op_growth_5y", "N/A")),
+                        dart_net_income_growth_var.set(dart_data.get("net_income_growth_5y", "N/A")),
                         dart_equity_var.set(summary.get("자본총계", "N/A")),
                     ),
                 )
@@ -2357,6 +2566,9 @@ def build_gui():
                         dart_net_cash_ps_ratio_var.set("-"),
                         dart_sales_var.set("-"),
                         dart_op_var.set("-"),
+                        dart_sales_growth_var.set("-"),
+                        dart_op_growth_var.set("-"),
+                        dart_net_income_growth_var.set("-"),
                         dart_equity_var.set("-"),
                     ),
                 )
@@ -2488,7 +2700,10 @@ def build_gui():
     add_row("주당 순현금/주가", dart_net_cash_ps_ratio_var, 8)
     add_row("매출액", dart_sales_var, 9)
     add_row("영업이익", dart_op_var, 10)
-    add_row("자본총계", dart_equity_var, 11)
+    add_row("매출성장률(5Y)", dart_sales_growth_var, 11)
+    add_row("영업이익성장률(5Y)", dart_op_growth_var, 12)
+    add_row("당기순이익성장률(5Y)", dart_net_income_growth_var, 13)
+    add_row("자본총계", dart_equity_var, 14)
 
     status_bar = ttk.Label(root, textvariable=status_var, anchor="w", relief="sunken")
     status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
