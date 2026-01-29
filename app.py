@@ -35,6 +35,13 @@ SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 STOOQ_QUOTE_URL = "https://stooq.pl/q/l/"
 SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
+EDGAR_REVENUE_KEYS = (
+    "Revenues",
+    "SalesRevenueNet",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueGoodsNet",
+    "SalesRevenueServicesNet",
+)
 SUBMISSIONS_INDEX_FILENAME = "submissions_index.jsonl"
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
@@ -899,11 +906,21 @@ def fetch_dart_financials(
     sales_growth_5y = "N/A"
     op_growth_5y = "N/A"
     net_income_growth_5y = "N/A"
+    sales_growth_5y_avg_pct = None
+    op_growth_5y_avg_pct = None
+    net_income_growth_5y_avg_pct = None
     try:
         revenue_series, op_series, net_series = collect_dart_annual_series(corp_code, window_years=5)
-        sales_growth_5y = format_yoy_average(revenue_series, window_years=5)
-        op_growth_5y = format_yoy_average(op_series, window_years=5)
-        net_income_growth_5y = format_yoy_average(net_series, window_years=5)
+        sales_growth_5y_avg_pct, sales_count, sales_transitions = compute_yoy_average_stats(
+            revenue_series, window_years=5
+        )
+        op_growth_5y_avg_pct, op_count, op_transitions = compute_yoy_average_stats(op_series, window_years=5)
+        net_income_growth_5y_avg_pct, net_count, net_transitions = compute_yoy_average_stats(
+            net_series, window_years=5
+        )
+        sales_growth_5y = build_yoy_average_text(sales_growth_5y_avg_pct, sales_count, sales_transitions)
+        op_growth_5y = build_yoy_average_text(op_growth_5y_avg_pct, op_count, op_transitions)
+        net_income_growth_5y = build_yoy_average_text(net_income_growth_5y_avg_pct, net_count, net_transitions)
     except Exception:
         pass
     if reprt_code:
@@ -1022,6 +1039,9 @@ def fetch_dart_financials(
             "sales_growth_5y": sales_growth_5y,
             "op_growth_5y": op_growth_5y,
             "net_income_growth_5y": net_income_growth_5y,
+            "sales_growth_5y_avg_pct": sales_growth_5y_avg_pct,
+            "op_growth_5y_avg_pct": op_growth_5y_avg_pct,
+            "net_income_growth_5y_avg_pct": net_income_growth_5y_avg_pct,
             "cash_equivalents": format_amount(cash_equivalents) if cash_equivalents is not None else "N/A",
             "liquid_funds": liquid_funds,
             "interest_bearing_debt": debt_value,
@@ -1243,10 +1263,12 @@ def _build_recent_year_window(
     return [(year, values_by_year.get(year)) for year in range(start_year, max_year + 1)]
 
 
-def format_yoy_average(values_by_year: Dict[int, Optional[float]], window_years: int = 5) -> str:
+def compute_yoy_average_stats(
+    values_by_year: Dict[int, Optional[float]], window_years: int = 5
+) -> Tuple[Optional[float], int, List[str]]:
     series = _build_recent_year_window(values_by_year, window_years)
     if len(series) < 2:
-        return "N/A"
+        return None, 0, []
     positive_rates: List[float] = []
     transitions: List[str] = []
     for (prev_year, prev_val), (curr_year, curr_val) in zip(series, series[1:]):
@@ -1263,11 +1285,18 @@ def format_yoy_average(values_by_year: Dict[int, Optional[float]], window_years:
             elif prev_val > 0 and curr_val <= 0:
                 transitions.append(f"흑자→적자 {prev_year}→{curr_year}")
 
-    parts = []
+    avg_pct = None
     if positive_rates:
         avg_rate = sum(positive_rates) / len(positive_rates)
-        avg_text = f"{avg_rate * 100:,.2f}%"
-        parts.append(f"양(+) 구간 {len(positive_rates)}개 평균")
+        avg_pct = avg_rate * 100
+    return avg_pct, len(positive_rates), transitions
+
+
+def build_yoy_average_text(avg_pct: Optional[float], count: int, transitions: List[str]) -> str:
+    parts = []
+    if avg_pct is not None:
+        avg_text = f"{avg_pct:,.2f}%"
+        parts.append(f"양(+) 구간 {count}개 평균")
     else:
         avg_text = "N/A"
         parts.append("양(+) 구간 없음")
@@ -1275,6 +1304,11 @@ def format_yoy_average(values_by_year: Dict[int, Optional[float]], window_years:
         parts.append(f"특이: {', '.join(transitions)}")
     suffix = "; ".join(parts)
     return f"{avg_text} ({suffix})" if suffix else avg_text
+
+
+def format_yoy_average(values_by_year: Dict[int, Optional[float]], window_years: int = 5) -> str:
+    avg_pct, count, transitions = compute_yoy_average_stats(values_by_year, window_years)
+    return build_yoy_average_text(avg_pct, count, transitions)
 
 
 def yahoo_symbol_for_ticker(ticker: str) -> str:
@@ -1740,6 +1774,13 @@ def extract_edgar_scan_fundamentals(facts: Dict) -> Dict[str, Any]:
         except Exception:
             net_cash_per_share_value = None
 
+    revenue_series = _extract_annual_series(facts, EDGAR_REVENUE_KEYS)
+    op_income_series = _extract_annual_series(facts, ("OperatingIncomeLoss",))
+    net_income_series = _extract_annual_series(facts, ("NetIncomeLoss",))
+    sales_avg_pct, _, _ = compute_yoy_average_stats(revenue_series, window_years=5)
+    op_avg_pct, _, _ = compute_yoy_average_stats(op_income_series, window_years=5)
+    net_avg_pct, _, _ = compute_yoy_average_stats(net_income_series, window_years=5)
+
     return {
         "liquid_funds_total": liquid_funds_total,
         "interest_bearing_debt": debt_value,
@@ -1751,6 +1792,9 @@ def extract_edgar_scan_fundamentals(facts: Dict) -> Dict[str, Any]:
         "liabilities_ratio_value": liabilities_ratio_value,
         "interest_bearing_debt_ratio_value": interest_bearing_ratio_value,
         "net_cash_per_share_value": net_cash_per_share_value,
+        "sales_growth_5y_avg_pct": sales_avg_pct,
+        "op_growth_5y_avg_pct": op_avg_pct,
+        "net_income_growth_5y_avg_pct": net_avg_pct,
     }
 
 
@@ -1852,14 +1896,7 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
 
     shares = _parse_int(_extract_latest_fact(facts, "CommonStockSharesOutstanding", units=("shares",)))
 
-    revenue_keys = (
-        "Revenues",
-        "SalesRevenueNet",
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueGoodsNet",
-        "SalesRevenueServicesNet",
-    )
-    revenue = _parse_int(_extract_latest_fact_multi(facts, revenue_keys))
+    revenue = _parse_int(_extract_latest_fact_multi(facts, EDGAR_REVENUE_KEYS))
     op_income = _parse_int(_extract_latest_fact(facts, "OperatingIncomeLoss"))
     net_income = _parse_int(_extract_latest_fact(facts, "NetIncomeLoss"))
     equity = _parse_int(
@@ -1869,13 +1906,25 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
     sales_growth_5y = "N/A"
     op_growth_5y = "N/A"
     net_income_growth_5y = "N/A"
+    sales_growth_5y_avg_pct = None
+    op_growth_5y_avg_pct = None
+    net_income_growth_5y_avg_pct = None
     try:
-        revenue_series = _extract_annual_series(facts, revenue_keys)
+        revenue_series = _extract_annual_series(facts, EDGAR_REVENUE_KEYS)
         op_income_series = _extract_annual_series(facts, ("OperatingIncomeLoss",))
         net_income_series = _extract_annual_series(facts, ("NetIncomeLoss",))
-        sales_growth_5y = format_yoy_average(revenue_series, window_years=5)
-        op_growth_5y = format_yoy_average(op_income_series, window_years=5)
-        net_income_growth_5y = format_yoy_average(net_income_series, window_years=5)
+        sales_growth_5y_avg_pct, sales_count, sales_transitions = compute_yoy_average_stats(
+            revenue_series, window_years=5
+        )
+        op_growth_5y_avg_pct, op_count, op_transitions = compute_yoy_average_stats(
+            op_income_series, window_years=5
+        )
+        net_income_growth_5y_avg_pct, net_count, net_transitions = compute_yoy_average_stats(
+            net_income_series, window_years=5
+        )
+        sales_growth_5y = build_yoy_average_text(sales_growth_5y_avg_pct, sales_count, sales_transitions)
+        op_growth_5y = build_yoy_average_text(op_growth_5y_avg_pct, op_count, op_transitions)
+        net_income_growth_5y = build_yoy_average_text(net_income_growth_5y_avg_pct, net_count, net_transitions)
     except Exception:
         pass
     usdkrw_rate = fetch_usdkrw_rate()
@@ -1968,6 +2017,9 @@ def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str
         "sales_growth_5y": sales_growth_5y,
         "op_growth_5y": op_growth_5y,
         "net_income_growth_5y": net_income_growth_5y,
+        "sales_growth_5y_avg_pct": sales_growth_5y_avg_pct,
+        "op_growth_5y_avg_pct": op_growth_5y_avg_pct,
+        "net_income_growth_5y_avg_pct": net_income_growth_5y_avg_pct,
         "liquid_funds_total": liquid_funds_total,
         "liquid_funds_current": liquid_funds_current,
         "liquid_funds_noncurrent": noncurrent_marketable,
@@ -2164,7 +2216,7 @@ def build_gui():
         selected_country = country_var.get()
         modal = tk.Toplevel(root)
         modal.title(f"Range Scan ({selected_country})")
-        modal.geometry("720x520")
+        modal.geometry("980x580")
         modal.resizable(True, True)
 
         per_min_var = tk.StringVar()
@@ -2177,6 +2229,9 @@ def build_gui():
         ib_debt_max_var = tk.StringVar()
         ncs_ratio_min_var = tk.StringVar()
         ncs_ratio_max_var = tk.StringVar()
+        sales_delta_min_var = tk.StringVar()
+        op_delta_min_var = tk.StringVar()
+        net_delta_min_var = tk.StringVar()
         scan_status_var = tk.StringVar(value="범위를 입력하거나 All을 체크 후 Scan을 눌러주세요.")
 
         controls = ttk.Frame(modal, padding=(8, 8))
@@ -2211,21 +2266,53 @@ def build_gui():
 
             ttk.Checkbutton(controls, text="All", variable=all_var, command=toggle_all).grid(row=row, column=4, sticky="w")
 
+        def add_min_field(row, label, min_var):
+            ttk.Label(controls, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            min_entry = ttk.Entry(controls, textvariable=min_var, width=10)
+            min_entry.grid(row=row, column=1, sticky="w", padx=(4, 8))
+            ttk.Label(controls, text="이상").grid(row=row, column=2, sticky="w")
+
+            all_var = tk.BooleanVar(value=False)
+            prev = {"min": ""}
+
+            def toggle_all():
+                if all_var.get():
+                    prev["min"] = min_var.get()
+                    min_var.set("all")
+                    min_entry.configure(state="disabled")
+                else:
+                    restore_min = prev.get("min", "")
+                    min_var.set("" if str(restore_min).strip().lower() == "all" else restore_min)
+                    min_entry.configure(state="normal")
+
+            ttk.Checkbutton(controls, text="All", variable=all_var, command=toggle_all).grid(
+                row=row, column=4, sticky="w"
+            )
+
         debt_label = "부채비율(KIS)" if selected_country == "KR" else "Liabilities/Equity (EDGAR, %)"
         ib_label = "이자부채/자본(%)" if selected_country == "KR" else "Interest-bearing debt/Equity (EDGAR, %)"
         ncs_label = "주당 순현금/주가(%)" if selected_country == "KR" else "Net cash/share ÷ Price (%)"
         ncs_col_label = "주당순현금/주가" if selected_country == "KR" else "Net cash/share ÷ Price"
+        delta_sales_label = "Δ매출성장률-PER" if selected_country == "KR" else "ΔSales growth-PER"
+        delta_op_label = "Δ영업이익성장률-PER" if selected_country == "KR" else "ΔOp income growth-PER"
+        delta_net_label = "Δ당기순이익성장률-PER" if selected_country == "KR" else "ΔNet income growth-PER"
+        delta_sales_col_label = "Δ매출" if selected_country == "KR" else "ΔSales"
+        delta_op_col_label = "Δ영업" if selected_country == "KR" else "ΔOp"
+        delta_net_col_label = "Δ순익" if selected_country == "KR" else "ΔNI"
 
         add_field(0, "PER", per_min_var, per_max_var)
         add_field(1, "PBR", pbr_min_var, pbr_max_var)
         add_field(2, debt_label, debt_min_var, debt_max_var)
         add_field(3, ib_label, ib_debt_min_var, ib_debt_max_var)
         add_field(4, ncs_label, ncs_ratio_min_var, ncs_ratio_max_var)
+        add_min_field(5, delta_sales_label, sales_delta_min_var)
+        add_min_field(6, delta_op_label, op_delta_min_var)
+        add_min_field(7, delta_net_label, net_delta_min_var)
 
-        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=5, rowspan=3, padx=4)
-        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=3, column=5, rowspan=2, padx=4)
+        ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=5, padx=4)
+        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=1, column=5, padx=4)
 
-        columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio")
+        columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio", "delta_sales", "delta_op", "delta_net")
         tree = ttk.Treeview(modal, columns=columns, show="headings", height=16)
         for col, text, width in (
             ("name", "Name", 180),
@@ -2234,6 +2321,9 @@ def build_gui():
             ("pbr", "PBR", 80),
             ("debt", debt_label, 110),
             ("net_cash_ratio", ncs_col_label, 140),
+            ("delta_sales", delta_sales_col_label, 90),
+            ("delta_op", delta_op_col_label, 90),
+            ("delta_net", delta_net_col_label, 90),
         ):
             tree.heading(col, text=text)
             tree.column(col, width=width, anchor="center")
@@ -2242,6 +2332,10 @@ def build_gui():
         scrollbar = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
         tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
+
+        hscroll = ttk.Scrollbar(modal, orient="horizontal", command=tree.xview)
+        tree.configure(xscroll=hscroll.set)
+        hscroll.pack(fill="x", padx=8)
 
         ttk.Label(modal, textvariable=scan_status_var, anchor="w").pack(fill="x", padx=8, pady=(0, 6))
 
@@ -2257,9 +2351,25 @@ def build_gui():
                 ib_debt_max = parse_float(ib_debt_max_var.get())
                 ncsr_min = parse_float(ncs_ratio_min_var.get())
                 ncsr_max = parse_float(ncs_ratio_max_var.get())
+                sales_delta_min = parse_float(sales_delta_min_var.get())
+                op_delta_min = parse_float(op_delta_min_var.get())
+                net_delta_min = parse_float(net_delta_min_var.get())
             except Exception:
                 scan_status_var.set("입력 파싱 오류")
                 return
+
+            def delta_passes(delta_min, growth_pct, per_value):
+                if delta_min is None:
+                    return True
+                if per_value is None or per_value <= 0:
+                    return False
+                if growth_pct is None or growth_pct <= 0:
+                    return False
+                try:
+                    delta_val = growth_pct - per_value
+                except Exception:
+                    return False
+                return delta_val >= delta_min
 
             for item in tree.get_children():
                 tree.delete(item)
@@ -2398,12 +2508,29 @@ def build_gui():
 
                                     liabilities_ratio_val = cand.get("liabilities_ratio_value")
                                     ib_ratio_val = cand.get("interest_bearing_debt_ratio_value")
+                                    sales_growth_pct = cand.get("sales_growth_5y_avg_pct")
+                                    op_growth_pct = cand.get("op_growth_5y_avg_pct")
+                                    net_growth_pct = cand.get("net_income_growth_5y_avg_pct")
+                                    delta_sales_val = None
+                                    delta_op_val = None
+                                    delta_net_val = None
+                                    if per_val is not None and per_val > 0:
+                                        if sales_growth_pct is not None:
+                                            delta_sales_val = sales_growth_pct - per_val
+                                        if op_growth_pct is not None:
+                                            delta_op_val = op_growth_pct - per_val
+                                        if net_growth_pct is not None:
+                                            delta_net_val = net_growth_pct - per_val
+
                                     if not (
                                         in_range(per_val, per_min, per_max)
                                         and in_range(pbr_val, pbr_min, pbr_max)
                                         and in_range(liabilities_ratio_val, debt_min, debt_max)
                                         and in_range(net_cash_ratio_val, ncsr_min, ncsr_max)
                                         and in_range(ib_ratio_val, ib_debt_min, ib_debt_max)
+                                        and delta_passes(sales_delta_min, sales_growth_pct, per_val)
+                                        and delta_passes(op_delta_min, op_growth_pct, per_val)
+                                        and delta_passes(net_delta_min, net_growth_pct, per_val)
                                     ):
                                         continue
 
@@ -2411,6 +2538,9 @@ def build_gui():
                                     liabilities_ratio_text = (
                                         f"{liabilities_ratio_val:,.2f}" if liabilities_ratio_val is not None else "N/A"
                                     )
+                                    delta_sales_text = f"{delta_sales_val:,.2f}" if delta_sales_val is not None else "N/A"
+                                    delta_op_text = f"{delta_op_val:,.2f}" if delta_op_val is not None else "N/A"
+                                    delta_net_text = f"{delta_net_val:,.2f}" if delta_net_val is not None else "N/A"
                                     values = (
                                         cand.get("name") or "N/A",
                                         ticker,
@@ -2418,6 +2548,9 @@ def build_gui():
                                         clean_number(pbr_val) if pbr_val is not None else "N/A",
                                         liabilities_ratio_text,
                                         net_cash_ratio_text,
+                                        delta_sales_text,
+                                        delta_op_text,
+                                        delta_net_text,
                                     )
                                     root.after(0, lambda vals=values: tree.insert("", "end", values=vals))
                                 except Exception as exc:
@@ -2475,6 +2608,19 @@ def build_gui():
                             ncs_ratio_text = dart_data.get("net_cash_per_share_ratio", "N/A")
                             ncs_ratio_val = parse_float(ncs_ratio_text)
                             ib_de_ratio_val = dart_data.get("interest_bearing_debt_ratio_value")
+                            sales_growth_pct = dart_data.get("sales_growth_5y_avg_pct")
+                            op_growth_pct = dart_data.get("op_growth_5y_avg_pct")
+                            net_growth_pct = dart_data.get("net_income_growth_5y_avg_pct")
+                            delta_sales_val = None
+                            delta_op_val = None
+                            delta_net_val = None
+                            if per_val is not None and per_val > 0:
+                                if sales_growth_pct is not None:
+                                    delta_sales_val = sales_growth_pct - per_val
+                                if op_growth_pct is not None:
+                                    delta_op_val = op_growth_pct - per_val
+                                if net_growth_pct is not None:
+                                    delta_net_val = net_growth_pct - per_val
 
                             if not (
                                 in_range(per_val, per_min, per_max)
@@ -2482,11 +2628,17 @@ def build_gui():
                                 and in_range(debt_val, debt_min, debt_max)
                                 and in_range(ncs_ratio_val, ncsr_min, ncsr_max)
                                 and in_range(ib_de_ratio_val, ib_debt_min, ib_debt_max)
+                                and delta_passes(sales_delta_min, sales_growth_pct, per_val)
+                                and delta_passes(op_delta_min, op_growth_pct, per_val)
+                                and delta_passes(net_delta_min, net_growth_pct, per_val)
                             ):
                                 continue
 
                             matched += 1
                             name = code_to_name.get(corp_code, snapshot.name or "N/A")
+                            delta_sales_text = f"{delta_sales_val:,.2f}" if delta_sales_val is not None else "N/A"
+                            delta_op_text = f"{delta_op_val:,.2f}" if delta_op_val is not None else "N/A"
+                            delta_net_text = f"{delta_net_val:,.2f}" if delta_net_val is not None else "N/A"
                             values = (
                                 name,
                                 stock_code,
@@ -2494,6 +2646,9 @@ def build_gui():
                                 snapshot.pbr,
                                 snapshot.debt_ratio,
                                 ncs_ratio_text,
+                                delta_sales_text,
+                                delta_op_text,
+                                delta_net_text,
                             )
                             root.after(0, lambda vals=values: tree.insert("", "end", values=vals))
                         except Exception as exc:
