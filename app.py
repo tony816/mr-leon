@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+import csv
 import io
 import json
 import os
@@ -33,6 +36,7 @@ DART_SINGLE_ACNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+YAHOO_QUOTE_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 STOOQ_QUOTE_URL = "https://stooq.pl/q/l/"
 SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
 EDGAR_REVENUE_KEYS = (
@@ -43,6 +47,13 @@ EDGAR_REVENUE_KEYS = (
     "SalesRevenueServicesNet",
 )
 SUBMISSIONS_INDEX_FILENAME = "submissions_index.jsonl"
+COUNTRY_CHOICES = ("US", "KR", "SG", "JP", "UK")
+GLOBAL_MARKETS = {
+    "SG": {"suffix": ".SI", "name": "Singapore", "scan_env": "SG_RANGE_SCAN_TICKERS"},
+    "JP": {"suffix": ".T", "name": "Japan", "scan_env": "JP_RANGE_SCAN_TICKERS"},
+    "UK": {"suffix": ".L", "name": "United Kingdom", "scan_env": "UK_RANGE_SCAN_TICKERS"},
+}
+JQUANTS_BASE_URL = "https://api.jquants.com"
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
 REPORT_SCHEDULE = (
@@ -63,6 +74,10 @@ class DartError(Exception):
 
 class EdgarError(Exception):
     """Raised when EDGAR data fetch fails."""
+
+
+class OfficialDataError(Exception):
+    """Raised when an official non-US/non-KR data source cannot satisfy a lookup."""
 
 
 def normalize_name(text: str) -> str:
@@ -775,7 +790,7 @@ def _sum_or_none(values) -> Optional[int]:
 def compute_net_cash(
     liquid_funds: Optional[int],
     interest_bearing_debt: Optional[int],
-    assume_zero_debt_when_missing: bool = False,
+    assume_zero_debt_when_missing: bool = True,
 ):
     """Return (net_cash, debt_value) with optional conservative zero-debt fallback."""
     if liquid_funds is None:
@@ -1460,11 +1475,535 @@ def fetch_stooq_quote(ticker: str, yahoo_error: Optional[str] = None) -> Dict[st
     }
 
 
+def yahoo_raw(value: Any) -> Any:
+    if isinstance(value, dict) and "raw" in value:
+        return value.get("raw")
+    return value
+
+
+def yahoo_fmt(value: Any, default: str = "N/A") -> str:
+    if isinstance(value, dict):
+        if value.get("fmt") not in (None, ""):
+            return str(value.get("fmt"))
+        value = value.get("raw")
+    if value in (None, ""):
+        return default
+    return clean_number(value)
+
+
+def resolve_global_symbol(user_text: str, country: str) -> str:
+    symbol = (user_text or "").strip().upper()
+    if not symbol:
+        raise EdgarError("Enter a ticker.")
+    if "." in symbol:
+        return symbol
+    market = GLOBAL_MARKETS.get(country)
+    if not market:
+        return yahoo_symbol_for_ticker(symbol)
+    return f"{symbol}{market['suffix']}"
+
+
+def fetch_yahoo_quote_summary(symbol: str) -> Dict[str, Any]:
+    modules = ",".join(
+        (
+            "price",
+            "summaryDetail",
+            "defaultKeyStatistics",
+            "financialData",
+            "balanceSheetHistory",
+            "incomeStatementHistory",
+        )
+    )
+    resp = requests.get(
+        YAHOO_QUOTE_SUMMARY_URL.format(symbol=symbol),
+        params={"modules": modules},
+        timeout=12,
+    )
+    if resp.status_code != 200:
+        raise EdgarError(f"Yahoo summary request failed: HTTP {resp.status_code}")
+    payload = resp.json().get("quoteSummary", {})
+    error = payload.get("error")
+    if error:
+        raise EdgarError(f"Yahoo summary error: {error}")
+    results = payload.get("result") or []
+    if not results:
+        raise EdgarError("Yahoo summary not found for ticker.")
+    return results[0] or {}
+
+
+def _first_statement(module: Dict[str, Any], key: str) -> Dict[str, Any]:
+    statements = module.get(key) if isinstance(module, dict) else None
+    if isinstance(statements, list) and statements:
+        return statements[0] or {}
+    return {}
+
+
+def _statement_series(module: Dict[str, Any], key: str, field: str) -> Dict[int, Optional[float]]:
+    values = {}
+    for entry in (module.get(key) or []) if isinstance(module, dict) else []:
+        year = None
+        end_date = entry.get("endDate")
+        if isinstance(end_date, dict):
+            fmt = str(end_date.get("fmt") or "")
+            year = _year_from_iso_date(fmt)
+        raw = yahoo_raw(entry.get(field))
+        if year and raw is not None:
+            values[year] = parse_float(raw)
+    return values
+
+
+def extract_yahoo_global_fundamentals(summary: Dict[str, Any]) -> Dict[str, Any]:
+    price = summary.get("price") or {}
+    detail = summary.get("summaryDetail") or {}
+    stats = summary.get("defaultKeyStatistics") or {}
+    financial = summary.get("financialData") or {}
+    bs_module = summary.get("balanceSheetHistory") or {}
+    is_module = summary.get("incomeStatementHistory") or {}
+    bs = _first_statement(bs_module, "balanceSheetStatements")
+    income = _first_statement(is_module, "incomeStatementHistory")
+
+    price_val = yahoo_raw(price.get("regularMarketPrice"))
+    shares = _parse_int(yahoo_raw(stats.get("sharesOutstanding")))
+    market_cap = yahoo_raw(price.get("marketCap")) or yahoo_raw(stats.get("enterpriseValue"))
+    per_val = yahoo_raw(detail.get("trailingPE")) or yahoo_raw(stats.get("trailingPE"))
+    pbr_val = yahoo_raw(stats.get("priceToBook")) or yahoo_raw(detail.get("priceToBook"))
+
+    cash_val = _parse_int(yahoo_raw(bs.get("cash")))
+    short_investments = _parse_int(yahoo_raw(bs.get("shortTermInvestments")))
+    liquid_funds_total = _sum_or_none([cash_val, short_investments])
+    total_debt = _parse_int(yahoo_raw(financial.get("totalDebt")) or yahoo_raw(bs.get("shortLongTermDebt")))
+    net_cash, debt_value = compute_net_cash(
+        liquid_funds_total, total_debt, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
+    )
+
+    revenue = _parse_int(yahoo_raw(income.get("totalRevenue")))
+    op_income = _parse_int(yahoo_raw(income.get("operatingIncome")))
+    net_income = _parse_int(yahoo_raw(income.get("netIncome")))
+    equity = _parse_int(yahoo_raw(bs.get("totalStockholderEquity")))
+    liabilities = _parse_int(yahoo_raw(bs.get("totalLiab")))
+
+    if per_val is None and market_cap is not None and net_income not in (None, 0):
+        per_val = market_cap / net_income
+    if pbr_val is None and market_cap is not None and equity not in (None, 0):
+        pbr_val = market_cap / equity
+
+    liabilities_ratio_pct = (liabilities / equity * 100) if liabilities is not None and equity not in (None, 0) else None
+    debt_ratio_pct = (debt_value / equity * 100) if debt_value is not None and equity not in (None, 0) else None
+    net_cash_per_share_value = (net_cash / shares) if net_cash is not None and shares else None
+    net_cash_ratio_val = (
+        (net_cash_per_share_value / price_val) * 100
+        if net_cash_per_share_value is not None and price_val not in (None, 0)
+        else None
+    )
+
+    revenue_series = _statement_series(is_module, "incomeStatementHistory", "totalRevenue")
+    op_series = _statement_series(is_module, "incomeStatementHistory", "operatingIncome")
+    net_series = _statement_series(is_module, "incomeStatementHistory", "netIncome")
+    sales_avg_pct, sales_count, sales_transitions = compute_yoy_average_stats(revenue_series, window_years=5)
+    op_avg_pct, op_count, op_transitions = compute_yoy_average_stats(op_series, window_years=5)
+    net_avg_pct, net_count, net_transitions = compute_yoy_average_stats(net_series, window_years=5)
+
+    return {
+        "name": yahoo_fmt(price.get("longName") or price.get("shortName"), default="N/A"),
+        "symbol": str(price.get("symbol") or ""),
+        "currency": str(price.get("currency") or ""),
+        "price_value": price_val,
+        "per_value": per_val,
+        "pbr_value": pbr_val,
+        "shares": shares,
+        "revenue": revenue,
+        "op_income": op_income,
+        "net_income": net_income,
+        "equity": equity,
+        "liabilities": liabilities,
+        "liquid_funds_total": liquid_funds_total,
+        "interest_bearing_debt": debt_value,
+        "net_cash": net_cash,
+        "net_cash_per_share_value": net_cash_per_share_value,
+        "net_cash_ratio_value": net_cash_ratio_val,
+        "liabilities_ratio_value": liabilities_ratio_pct,
+        "interest_bearing_debt_ratio_value": debt_ratio_pct,
+        "sales_growth_5y_avg_pct": sales_avg_pct,
+        "op_growth_5y_avg_pct": op_avg_pct,
+        "net_income_growth_5y_avg_pct": net_avg_pct,
+        "sales_growth_5y": build_yoy_average_text(sales_avg_pct, sales_count, sales_transitions),
+        "op_growth_5y": build_yoy_average_text(op_avg_pct, op_count, op_transitions),
+        "net_income_growth_5y": build_yoy_average_text(net_avg_pct, net_count, net_transitions),
+    }
+
+
+class JQuantsClient:
+    """Official JPX Group J-Quants API client for Japan listings, prices, and statements."""
+
+    def __init__(
+        self,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: str = JQUANTS_BASE_URL,
+    ):
+        self.email = email or os.getenv("JQUANTS_EMAIL")
+        self.password = password or os.getenv("JQUANTS_PASSWORD")
+        self.api_key = api_key or os.getenv("JQUANTS_API_KEY") or os.getenv("JQUANTS_REFRESH_TOKEN")
+        self.id_token = os.getenv("JQUANTS_ID_TOKEN")
+        if not self.api_key and not self.id_token and not (self.email and self.password):
+            raise OfficialDataError(
+                "Set JQUANTS_API_KEY, JQUANTS_ID_TOKEN, or JQUANTS_EMAIL/JQUANTS_PASSWORD to use official Japan data."
+            )
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self._id_token: Optional[str] = None
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        return self.session.request(method, f"{self.base_url}{path}", timeout=15, **kwargs)
+
+    def _ensure_token(self) -> str:
+        if self._id_token:
+            return self._id_token
+        if self.id_token:
+            self._id_token = self.id_token
+            return self._id_token
+        if self.api_key:
+            # J-Quants dashboard-issued values are commonly refresh tokens. If a JWT
+            # is supplied, treat it as an id token and use it directly.
+            if self.api_key.count(".") == 2:
+                self._id_token = self.api_key
+                return self._id_token
+            resp = self._request("POST", "/v1/token/auth_refresh", params={"refreshtoken": self.api_key})
+            if resp.status_code != 200:
+                raise OfficialDataError(f"J-Quants auth_refresh failed: HTTP {resp.status_code} {resp.text}")
+            self._id_token = resp.json().get("idToken")
+            if not self._id_token:
+                raise OfficialDataError("J-Quants auth_refresh response missing idToken.")
+            return self._id_token
+        resp = self._request(
+            "POST",
+            "/v1/token/auth_user",
+            json={"mailaddress": self.email, "password": self.password},
+        )
+        if resp.status_code != 200:
+            raise OfficialDataError(f"J-Quants auth_user failed: HTTP {resp.status_code} {resp.text}")
+        refresh_token = resp.json().get("refreshToken")
+        if not refresh_token:
+            raise OfficialDataError("J-Quants auth_user response missing refreshToken.")
+        resp = self._request("POST", "/v1/token/auth_refresh", params={"refreshtoken": refresh_token})
+        if resp.status_code != 200:
+            raise OfficialDataError(f"J-Quants auth_refresh failed: HTTP {resp.status_code} {resp.text}")
+        self._id_token = resp.json().get("idToken")
+        if not self._id_token:
+            raise OfficialDataError("J-Quants auth_refresh response missing idToken.")
+        return self._id_token
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self._ensure_token()}"}
+
+    def get_listed_info(self, code: Optional[str] = None) -> List[Dict[str, Any]]:
+        params = {"code": code} if code else {}
+        resp = self._request("GET", "/v1/listed/info", headers=self._headers(), params=params)
+        if resp.status_code != 200:
+            raise OfficialDataError(f"J-Quants listed info failed: HTTP {resp.status_code} {resp.text}")
+        return resp.json().get("info") or []
+
+    def get_statements(self, code: str) -> List[Dict[str, Any]]:
+        resp = self._request("GET", "/v1/fins/statements", headers=self._headers(), params={"code": code})
+        if resp.status_code != 200:
+            raise OfficialDataError(f"J-Quants statements failed: HTTP {resp.status_code} {resp.text}")
+        return resp.json().get("statements") or []
+
+    def get_daily_quotes(self, code: str) -> List[Dict[str, Any]]:
+        resp = self._request("GET", "/v1/prices/daily_quotes", headers=self._headers(), params={"code": code})
+        if resp.status_code != 200:
+            raise OfficialDataError(f"J-Quants daily quotes failed: HTTP {resp.status_code} {resp.text}")
+        return resp.json().get("daily_quotes") or []
+
+
+def normalize_jp_code(user_text: str) -> str:
+    code = (user_text or "").strip().upper()
+    code = code[:-2] if code.endswith(".T") else code
+    digits = "".join(ch for ch in code if ch.isdigit())
+    if len(digits) < 4:
+        raise OfficialDataError("Enter a 4-digit Japanese stock code, e.g. 7203.")
+    return digits[:4]
+
+
+def latest_jquants_statement(statements: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not statements:
+        raise OfficialDataError("No J-Quants financial statements found.")
+    return sorted(
+        statements,
+        key=lambda x: str(x.get("DisclosedDate") or x.get("CurrentFiscalYearEndDate") or ""),
+        reverse=True,
+    )[0]
+
+
+def latest_jquants_quote(quotes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not quotes:
+        return {}
+    return sorted(quotes, key=lambda x: str(x.get("Date") or ""), reverse=True)[0]
+
+
+def jquants_value(entry: Dict[str, Any], *keys) -> Optional[float]:
+    for key in keys:
+        value = entry.get(key)
+        parsed = parse_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def jquants_int(entry: Dict[str, Any], *keys) -> Optional[int]:
+    value = jquants_value(entry, *keys)
+    return int(value) if value is not None else None
+
+
+def fetch_jquants_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, Any]]:
+    code = normalize_jp_code(user_text)
+    client = JQuantsClient()
+    info_list = client.get_listed_info(code)
+    info = info_list[0] if info_list else {}
+    statement = latest_jquants_statement(client.get_statements(code))
+    quote = latest_jquants_quote(client.get_daily_quotes(code))
+
+    name = info.get("CompanyNameEnglish") or info.get("CompanyName") or code
+    price_val = jquants_value(quote, "AdjustmentClose", "Close")
+    revenue = jquants_int(statement, "NetSales", "OperatingRevenue")
+    op_income = jquants_int(statement, "OperatingProfit", "OperatingIncome")
+    net_income = jquants_int(statement, "Profit", "ProfitAttributableToOwnersOfParent")
+    equity = jquants_int(statement, "Equity", "NetAssets")
+    liabilities = jquants_int(statement, "Liabilities")
+    cash_val = jquants_int(statement, "CashAndEquivalents", "CashAndDeposits")
+    debt_val = jquants_int(statement, "InterestBearingDebt")
+    shares = jquants_int(statement, "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock")
+
+    eps = jquants_value(statement, "EarningsPerShare")
+    bps = jquants_value(statement, "BookValuePerShare")
+    per_val = price_val / eps if price_val is not None and eps not in (None, 0) else None
+    pbr_val = price_val / bps if price_val is not None and bps not in (None, 0) else None
+    net_cash, debt_used = compute_net_cash(
+        cash_val, debt_val, assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING
+    )
+    liabilities_ratio_pct = (liabilities / equity * 100) if liabilities is not None and equity not in (None, 0) else None
+    debt_ratio_pct = (debt_used / equity * 100) if debt_used is not None and equity not in (None, 0) else None
+    net_cash_ps = net_cash / shares if net_cash is not None and shares else None
+    net_cash_ratio = (net_cash_ps / price_val * 100) if net_cash_ps is not None and price_val not in (None, 0) else None
+
+    statement_series = {}
+    op_series = {}
+    net_series = {}
+    for item in client.get_statements(code):
+        year = _coerce_year(item.get("CurrentFiscalYearEndDate") or item.get("DisclosedDate"))
+        if not year:
+            continue
+        statement_series[year] = jquants_value(item, "NetSales", "OperatingRevenue")
+        op_series[year] = jquants_value(item, "OperatingProfit", "OperatingIncome")
+        net_series[year] = jquants_value(item, "Profit", "ProfitAttributableToOwnersOfParent")
+    sales_avg, sales_count, sales_transitions = compute_yoy_average_stats(statement_series, window_years=5)
+    op_avg, op_count, op_transitions = compute_yoy_average_stats(op_series, window_years=5)
+    net_avg, net_count, net_transitions = compute_yoy_average_stats(net_series, window_years=5)
+
+    net_cash_ratio_text = f"{net_cash_ratio:,.2f}%" if net_cash_ratio is not None else "N/A"
+    liabilities_ratio_text = f"{liabilities_ratio_pct:,.2f}" if liabilities_ratio_pct is not None else "N/A"
+    ib_ratio_text = f"{debt_ratio_pct:,.2f}" if debt_ratio_pct is not None else "N/A"
+    snapshot = PriceSnapshot(
+        name=str(name),
+        code=code,
+        price=clean_number(price_val) if price_val is not None else "N/A",
+        per=clean_number(per_val) if per_val is not None else "N/A",
+        pbr=clean_number(pbr_val) if pbr_val is not None else "N/A",
+        cash=format_amount(cash_val) if cash_val is not None else "N/A",
+        debt_ratio=liabilities_ratio_text,
+        listed_shares=shares,
+        net_cash_per_share_ratio=net_cash_ratio_text,
+    )
+    detail = {
+        "corp_name": str(name),
+        "corp_code": code,
+        "bsns_year": str(_coerce_year(statement.get("CurrentFiscalYearEndDate") or statement.get("DisclosedDate")) or "-"),
+        "summary": {
+            "매출액": format_amount(revenue) if revenue is not None else "N/A",
+            "영업이익": format_amount(op_income) if op_income is not None else "N/A",
+            "자본총계": format_amount(equity) if equity is not None else "N/A",
+            "留ㅼ텧??": format_amount(revenue) if revenue is not None else "N/A",
+            "?곸뾽?댁씡": format_amount(op_income) if op_income is not None else "N/A",
+            "?먮낯珥앷퀎": format_amount(equity) if equity is not None else "N/A",
+        },
+        "sales_growth_5y": build_yoy_average_text(sales_avg, sales_count, sales_transitions),
+        "op_growth_5y": build_yoy_average_text(op_avg, op_count, op_transitions),
+        "net_income_growth_5y": build_yoy_average_text(net_avg, net_count, net_transitions),
+        "sales_growth_5y_avg_pct": sales_avg,
+        "op_growth_5y_avg_pct": op_avg,
+        "net_income_growth_5y_avg_pct": net_avg,
+        "liquid_funds_total": cash_val,
+        "interest_bearing_debt": debt_used,
+        "net_cash": net_cash,
+        "net_cash_display": format_amount(net_cash) if net_cash is not None else "N/A",
+        "float_shares": shares,
+        "float_shares_display": format_amount(shares) if shares is not None else None,
+        "net_cash_per_share": format_per_share(net_cash, shares),
+        "net_cash_per_share_ratio": net_cash_ratio_text,
+        "liabilities_ratio_value": liabilities_ratio_pct,
+        "interest_bearing_debt_ratio": ib_ratio_text,
+        "interest_bearing_debt_ratio_value": debt_ratio_pct,
+        "debt_ratio": liabilities_ratio_text,
+        "quote_source": "j-quants",
+        "currency": "JPY",
+    }
+    return snapshot, detail
+
+
+def jquants_configured() -> bool:
+    return bool(
+        os.getenv("JQUANTS_API_KEY")
+        or os.getenv("JQUANTS_REFRESH_TOKEN")
+        or os.getenv("JQUANTS_ID_TOKEN")
+        or (os.getenv("JQUANTS_EMAIL") and os.getenv("JQUANTS_PASSWORD"))
+    )
+
+
+def fetch_global_financials(user_text: str, country: str) -> Tuple[PriceSnapshot, Dict[str, Any]]:
+    if country == "JP" and jquants_configured():
+        return fetch_jquants_financials(user_text)
+
+    symbol = resolve_global_symbol(user_text, country)
+    summary_error = None
+    try:
+        summary = fetch_yahoo_quote_summary(symbol)
+        f = extract_yahoo_global_fundamentals(summary)
+    except Exception as exc:
+        summary_error = str(exc)
+        try:
+            quote = fetch_yahoo_quote(symbol)
+        except Exception as quote_exc:
+            summary_error = f"{summary_error}; quote fallback failed: {quote_exc}"
+            quote = {}
+        f = {
+            "name": symbol,
+            "symbol": symbol,
+            "currency": quote.get("currency") or "",
+            "price_value": quote.get("price"),
+            "per_value": quote.get("per"),
+            "pbr_value": quote.get("pbr"),
+            "shares": None,
+            "revenue": None,
+            "op_income": None,
+            "net_income": None,
+            "equity": None,
+            "liabilities": None,
+            "liquid_funds_total": None,
+            "interest_bearing_debt": None,
+            "net_cash": None,
+            "net_cash_per_share_value": None,
+            "net_cash_ratio_value": None,
+            "liabilities_ratio_value": None,
+            "interest_bearing_debt_ratio_value": None,
+            "sales_growth_5y_avg_pct": None,
+            "op_growth_5y_avg_pct": None,
+            "net_income_growth_5y_avg_pct": None,
+            "sales_growth_5y": "N/A",
+            "op_growth_5y": "N/A",
+            "net_income_growth_5y": "N/A",
+        }
+    display_name = f.get("name") if f.get("name") != "N/A" else symbol
+    net_cash_ratio_text = (
+        f"{f['net_cash_ratio_value']:,.2f}%" if f.get("net_cash_ratio_value") is not None else "N/A"
+    )
+    liabilities_ratio_text = (
+        f"{f['liabilities_ratio_value']:,.2f}" if f.get("liabilities_ratio_value") is not None else "N/A"
+    )
+    ib_ratio_text = (
+        f"{f['interest_bearing_debt_ratio_value']:,.2f}"
+        if f.get("interest_bearing_debt_ratio_value") is not None
+        else "N/A"
+    )
+
+    snapshot = PriceSnapshot(
+        name=display_name,
+        code=symbol,
+        price=clean_number(f.get("price_value")) if f.get("price_value") is not None else "N/A",
+        per=clean_number(f.get("per_value")) if f.get("per_value") is not None else "N/A",
+        pbr=clean_number(f.get("pbr_value")) if f.get("pbr_value") is not None else "N/A",
+        cash=format_amount(f.get("liquid_funds_total")) if f.get("liquid_funds_total") is not None else "N/A",
+        debt_ratio=liabilities_ratio_text,
+        listed_shares=f.get("shares"),
+        net_cash_per_share_ratio=net_cash_ratio_text,
+    )
+    detail = {
+        "corp_name": display_name,
+        "corp_code": symbol,
+        "bsns_year": "-",
+        "summary": {
+            "매출액": format_amount(f.get("revenue")) if f.get("revenue") is not None else "N/A",
+            "영업이익": format_amount(f.get("op_income")) if f.get("op_income") is not None else "N/A",
+            "자본총계": format_amount(f.get("equity")) if f.get("equity") is not None else "N/A",
+            "留ㅼ텧??": format_amount(f.get("revenue")) if f.get("revenue") is not None else "N/A",
+            "?곸뾽?댁씡": format_amount(f.get("op_income")) if f.get("op_income") is not None else "N/A",
+            "?먮낯珥앷퀎": format_amount(f.get("equity")) if f.get("equity") is not None else "N/A",
+        },
+        "sales_growth_5y": f.get("sales_growth_5y", "N/A"),
+        "op_growth_5y": f.get("op_growth_5y", "N/A"),
+        "net_income_growth_5y": f.get("net_income_growth_5y", "N/A"),
+        "sales_growth_5y_avg_pct": f.get("sales_growth_5y_avg_pct"),
+        "op_growth_5y_avg_pct": f.get("op_growth_5y_avg_pct"),
+        "net_income_growth_5y_avg_pct": f.get("net_income_growth_5y_avg_pct"),
+        "liquid_funds_total": f.get("liquid_funds_total"),
+        "interest_bearing_debt": f.get("interest_bearing_debt"),
+        "net_cash": f.get("net_cash"),
+        "net_cash_display": format_amount(f.get("net_cash")) if f.get("net_cash") is not None else "N/A",
+        "float_shares": f.get("shares"),
+        "float_shares_display": format_amount(f.get("shares")) if f.get("shares") is not None else None,
+        "net_cash_per_share": format_per_share(f.get("net_cash"), f.get("shares")),
+        "net_cash_per_share_ratio": net_cash_ratio_text,
+        "liabilities_ratio_value": f.get("liabilities_ratio_value"),
+        "interest_bearing_debt_ratio": ib_ratio_text,
+        "interest_bearing_debt_ratio_value": f.get("interest_bearing_debt_ratio_value"),
+        "debt_ratio": liabilities_ratio_text,
+        "quote_source": "yahoo",
+        "quote_error": summary_error,
+        "currency": f.get("currency"),
+    }
+    return snapshot, detail
+
+
 def clean_number(val: str) -> str:
     try:
         return f"{float(val):,}"
     except (ValueError, TypeError):
         return str(val)
+
+
+def export_rows_to_spreadsheet(path: str, headers: List[str], rows: List[Tuple[Any, ...]]) -> str:
+    """Write scan rows to .xlsx when openpyxl is available, otherwise CSV."""
+    output_path = Path(path)
+    if output_path.suffix.lower() == ".xlsx":
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font
+            from openpyxl.utils import get_column_letter
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Range Scan"
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for row in rows:
+                ws.append(list(row))
+            for col_idx, header in enumerate(headers, start=1):
+                max_len = len(str(header))
+                for cell in ws[get_column_letter(col_idx)]:
+                    max_len = max(max_len, len(str(cell.value or "")))
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 40)
+            ws.freeze_panes = "A2"
+            wb.save(output_path)
+            return str(output_path)
+        except ImportError:
+            output_path = output_path.with_suffix(".csv")
+
+    with output_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+    return str(output_path)
 
 
 @dataclass
@@ -2156,6 +2695,26 @@ def run_dart_cli(symbol: Optional[str], year: Optional[str]) -> int:
     return 0
 
 
+def run_global_cli(symbol: Optional[str], country: str) -> int:
+    prompt = f"Enter {country} ticker (Yahoo suffix is added if omitted): "
+    user_input = symbol or input(prompt).strip()
+    try:
+        snapshot, detail = fetch_global_financials(user_input, country)
+    except Exception as exc:
+        print(f"{country} lookup failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{snapshot.name} ({snapshot.code})")
+    print(f"Price: {snapshot.price}")
+    print(f"PER: {snapshot.per}")
+    print(f"PBR: {snapshot.pbr}")
+    print(f"Liabilities/Equity: {snapshot.debt_ratio}")
+    print(f"Interest-bearing debt/Equity: {detail.get('interest_bearing_debt_ratio', 'N/A')}")
+    print(f"Net cash/share: {detail.get('net_cash_per_share', 'N/A')}")
+    print(f"Net cash/share / price: {detail.get('net_cash_per_share_ratio', 'N/A')}")
+    return 0
+
+
 def gui_supported() -> Tuple[bool, Optional[str]]:
     if sys.platform != "darwin":
         return True, None
@@ -2175,7 +2734,7 @@ def gui_supported() -> Tuple[bool, Optional[str]]:
 
 def build_gui():
     import tkinter as tk
-    from tkinter import ttk, messagebox
+    from tkinter import ttk, messagebox, filedialog
 
     root = tk.Tk()
     root.title("KIS/DART/EDGAR Viewer")
@@ -2192,7 +2751,7 @@ def build_gui():
     country_var = tk.StringVar(value="US")
     input_var = tk.StringVar()
     status_var = tk.StringVar(
-        value="Select a country, then enter a company. KR requires KIS/DART keys; US uses EDGAR."
+        value="Select a country, then enter a company. KR uses KIS/DART; US uses EDGAR; SG/JP/UK use Yahoo."
     )
     name_var = tk.StringVar(value="-")
     price_var = tk.StringVar(value="-")
@@ -2310,7 +2869,8 @@ def build_gui():
         add_min_field(7, delta_net_label, net_delta_min_var)
 
         ttk.Button(controls, text="Scan", command=lambda: start_scan()).grid(row=0, column=5, padx=4)
-        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=1, column=5, padx=4)
+        ttk.Button(controls, text="Export", command=lambda: export_scan_results()).grid(row=1, column=5, padx=4)
+        ttk.Button(controls, text="Close", command=modal.destroy).grid(row=2, column=5, padx=4)
 
         columns = ("name", "code", "per", "pbr", "debt", "net_cash_ratio", "delta_sales", "delta_op", "delta_net")
         tree = ttk.Treeview(modal, columns=columns, show="headings", height=16)
@@ -2338,6 +2898,32 @@ def build_gui():
         hscroll.pack(fill="x", padx=8)
 
         ttk.Label(modal, textvariable=scan_status_var, anchor="w").pack(fill="x", padx=8, pady=(0, 6))
+
+        def export_scan_results():
+            items = tree.get_children()
+            if not items:
+                messagebox.showinfo("Export", "No scan results to export.")
+                return
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"range_scan_{selected_country}_{timestamp}.xlsx"
+            path = filedialog.asksaveasfilename(
+                parent=modal,
+                title="Export range scan results",
+                defaultextension=".xlsx",
+                initialfile=default_name,
+                filetypes=(("Excel workbook", "*.xlsx"), ("CSV", "*.csv"), ("All files", "*.*")),
+            )
+            if not path:
+                return
+            headers = [tree.heading(col).get("text") or col for col in columns]
+            rows = [tuple(tree.item(item, "values")) for item in items]
+            try:
+                saved_path = export_rows_to_spreadsheet(path, headers, rows)
+            except Exception as exc:
+                messagebox.showerror("Export failed", str(exc))
+                return
+            scan_status_var.set(f"Exported {len(rows)} rows: {saved_path}")
+            messagebox.showinfo("Export complete", f"Saved {len(rows)} rows to:\n{saved_path}")
 
         def start_scan():
             try:
@@ -2383,7 +2969,7 @@ def build_gui():
                         pass
 
                 try:
-                    if selected_country != "KR":
+                    if selected_country == "US":
                         index = ensure_submissions_index(status_cb=set_scan_status)
                         entries = index.get("entries", []) if isinstance(index, dict) else []
                         targets = []
@@ -2567,6 +3153,86 @@ def build_gui():
                             )
                         else:
                             set_scan_status(f"완료: {matched}개 매치 / {total_quotes}개 처리")
+                        return
+
+                    if selected_country in GLOBAL_MARKETS:
+                        market = GLOBAL_MARKETS[selected_country]
+                        raw_tickers = os.getenv(market["scan_env"], "")
+                        tickers = [
+                            t.strip()
+                            for t in re.split(r"[\s,;]+", raw_tickers)
+                            if t.strip()
+                        ]
+                        if not tickers and selected_country == "JP" and jquants_configured():
+                            set_scan_status("Loading JPX/J-Quants listed companies...")
+                            try:
+                                jp_limit = int(os.getenv("JP_RANGE_SCAN_LIMIT", "0") or "0")
+                            except Exception:
+                                jp_limit = 0
+                            jquants_info = JQuantsClient().get_listed_info()
+                            tickers = [str(item.get("Code") or item.get("LocalCode") or "").strip()[:4] for item in jquants_info]
+                            tickers = [t for t in tickers if t]
+                            if jp_limit > 0:
+                                tickers = tickers[:jp_limit]
+                        if not tickers:
+                            set_scan_status(
+                                f"{market['scan_env']}에 스캔할 티커를 설정하세요. 예: D05, C6L, Z74"
+                            )
+                            return
+
+                        total = len(tickers)
+                        matched = 0
+                        last_error = None
+                        set_scan_status(f"Scanning {market['name']}... 0/{total}")
+                        for processed, ticker_text in enumerate(tickers, start=1):
+                            try:
+                                snapshot, detail = fetch_global_financials(ticker_text, selected_country)
+                                per_val = parse_float(snapshot.per)
+                                pbr_val = parse_float(snapshot.pbr)
+                                debt_val = detail.get("liabilities_ratio_value")
+                                ib_de_ratio_val = detail.get("interest_bearing_debt_ratio_value")
+                                ncs_ratio_val = parse_float(detail.get("net_cash_per_share_ratio"))
+                                sales_growth_pct = detail.get("sales_growth_5y_avg_pct")
+                                op_growth_pct = detail.get("op_growth_5y_avg_pct")
+                                net_growth_pct = detail.get("net_income_growth_5y_avg_pct")
+                                delta_sales_val = sales_growth_pct - per_val if sales_growth_pct is not None and per_val else None
+                                delta_op_val = op_growth_pct - per_val if op_growth_pct is not None and per_val else None
+                                delta_net_val = net_growth_pct - per_val if net_growth_pct is not None and per_val else None
+
+                                if not (
+                                    in_range(per_val, per_min, per_max)
+                                    and in_range(pbr_val, pbr_min, pbr_max)
+                                    and in_range(debt_val, debt_min, debt_max)
+                                    and in_range(ncs_ratio_val, ncsr_min, ncsr_max)
+                                    and in_range(ib_de_ratio_val, ib_debt_min, ib_debt_max)
+                                    and delta_passes(sales_delta_min, sales_growth_pct, per_val)
+                                    and delta_passes(op_delta_min, op_growth_pct, per_val)
+                                    and delta_passes(net_delta_min, net_growth_pct, per_val)
+                                ):
+                                    continue
+
+                                matched += 1
+                                values = (
+                                    snapshot.name,
+                                    snapshot.code,
+                                    snapshot.per,
+                                    snapshot.pbr,
+                                    f"{debt_val:,.2f}" if debt_val is not None else "N/A",
+                                    detail.get("net_cash_per_share_ratio", "N/A"),
+                                    f"{delta_sales_val:,.2f}" if delta_sales_val is not None else "N/A",
+                                    f"{delta_op_val:,.2f}" if delta_op_val is not None else "N/A",
+                                    f"{delta_net_val:,.2f}" if delta_net_val is not None else "N/A",
+                                )
+                                root.after(0, lambda vals=values: tree.insert("", "end", values=vals))
+                            except Exception as exc:
+                                last_error = str(exc)
+                            if processed % 10 == 0 or processed == total:
+                                set_scan_status(f"Scanning {market['name']}... {processed}/{total}, matched {matched}")
+
+                        if last_error:
+                            set_scan_status(f"완료: {matched}개 매치 / {total}개 처리 (마지막 오류: {last_error})")
+                        else:
+                            set_scan_status(f"완료: {matched}개 매치 / {total}개 처리")
                         return
 
                     app_key = os.getenv("KIS_APP_KEY")
@@ -2791,6 +3457,23 @@ def build_gui():
             threading.Thread(target=worker, daemon=True).start()
             return
 
+        if selected_country in GLOBAL_MARKETS:
+            def worker():
+                set_status(f"Fetching ({selected_country})...")
+                try:
+                    snapshot, detail = fetch_global_financials(user_input, selected_country)
+                except Exception as exc:
+                    messagebox.showerror("Yahoo lookup failed", str(exc))
+                    update_view(PriceSnapshot(name="N/A", code=user_input or "-", price="N/A", per="N/A", pbr="N/A"), None)
+                    set_status(f"Yahoo 실패: {exc}")
+                    return
+
+                update_view(snapshot, detail)
+                set_status("Done")
+
+            threading.Thread(target=worker, daemon=True).start()
+            return
+
         def worker():
             set_status("Fetching (US)...")
             try:
@@ -2808,7 +3491,7 @@ def build_gui():
 
     ttk.Label(root, text="Company name or code").grid(row=0, column=0, sticky="w")
     ttk.Label(root, text="Country").grid(row=0, column=1, sticky="e")
-    country_combo = ttk.Combobox(root, textvariable=country_var, values=("US", "KR"), state="readonly", width=8)
+    country_combo = ttk.Combobox(root, textvariable=country_var, values=COUNTRY_CHOICES, state="readonly", width=8)
     country_combo.grid(row=0, column=2, sticky="ew")
     entry = ttk.Entry(root, textvariable=input_var)
     entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
@@ -2872,10 +3555,14 @@ if __name__ == "__main__":
     parser.add_argument("--dart", action="store_true", help="Run DART financial summary lookup (CLI)")
     parser.add_argument("--dart-year", dest="dart_year", help="Business year (YYYY) for DART lookup")
     parser.add_argument("--symbol", help="Symbol or code to use in CLI mode")
+    parser.add_argument("--country", choices=COUNTRY_CHOICES, default="KR", help="Country for CLI mode")
     args = parser.parse_args()
 
     if args.dart:
         sys.exit(run_dart_cli(args.symbol, args.dart_year))
+
+    if args.cli and args.country in GLOBAL_MARKETS:
+        sys.exit(run_global_cli(args.symbol, args.country))
 
     can_gui, reason = gui_supported()
     if args.cli or not can_gui:

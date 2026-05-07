@@ -15,6 +15,23 @@ KIS_APP_SECRET=your_app_secret
 DART_KEY=your_dart_key
 ```
 
+Optional official/global market settings:
+```
+# Japan official JPX/J-Quants API; used before Yahoo for JP.
+JQUANTS_API_KEY=your_jquants_refresh_or_id_token
+# Optional legacy login flow:
+# JQUANTS_EMAIL=your_jquants_email
+# JQUANTS_PASSWORD=your_jquants_password
+
+# SG/JP/UK range scan target lists.
+SG_RANGE_SCAN_TICKERS=D05,C6L,Z74
+JP_RANGE_SCAN_TICKERS=7203,6758,9984
+UK_RANGE_SCAN_TICKERS=HSBA,BP,ULVR
+
+# Optional cap when JP range scan loads the full J-Quants listed-company list.
+JP_RANGE_SCAN_LIMIT=200
+```
+
 ## 설치와 실행
 ```
 python -m venv .venv
