@@ -17,20 +17,53 @@ DART_KEY=your_dart_key
 
 Optional official/global market settings:
 ```
-# Japan official JPX/J-Quants API; used before Yahoo for JP.
-JQUANTS_API_KEY=your_jquants_refresh_or_id_token
+# Japan official JPX/J-Quants API V2.
+JQUANTS_API_KEY=your_jquants_v2_api_key
 # Optional legacy login flow:
 # JQUANTS_EMAIL=your_jquants_email
 # JQUANTS_PASSWORD=your_jquants_password
+# JQUANTS_REFRESH_TOKEN=your_legacy_v1_refresh_token
+# JQUANTS_ID_TOKEN=your_legacy_v1_id_token
 
-# SG/JP/UK range scan target lists.
+# SG/UK/AU quote lookup target lists. Official fundamentals scan is currently US/KR/JP.
 SG_RANGE_SCAN_TICKERS=D05,C6L,Z74
-JP_RANGE_SCAN_TICKERS=7203,6758,9984
+# JP_RANGE_SCAN_TICKERS is optional for cache building experiments.
+# JP_RANGE_SCAN_TICKERS=7203,6758,9984
 UK_RANGE_SCAN_TICKERS=HSBA,BP,ULVR
+# AU_RANGE_SCAN_TICKERS is optional for quote lookup experiments.
+# AU_RANGE_SCAN_TICKERS=BHP,CBA,WES
 
-# Optional cap when JP range scan loads the full J-Quants listed-company list.
-JP_RANGE_SCAN_LIMIT=200
+# Free plan is 5 requests/minute. Full JP scan is slow by design.
+JQUANTS_REQUESTS_PER_MINUTE=5
+JQUANTS_MAX_RETRIES=6
 ```
+
+## Windows quick start
+Double-click `install_requirements.bat` once to install dependencies, then double-click `run_gui.bat` to start the GUI.
+
+## JP fundamentals cache
+Build or resume the J-Quants fundamentals cache:
+```
+python app.py --build-jp-cache
+```
+By default this stores official financial fundamentals only. Range Scan fetches current JP prices from Yahoo in batches and combines them with the cache.
+
+Useful options:
+```
+python app.py --build-jp-cache --jp-cache-limit 10
+python app.py --build-jp-cache --jp-cache-force
+python app.py --build-jp-cache --jp-cache-include-price
+python app.py --build-jp-cache --jp-cache-output data/jp_fundamentals_cache.jsonl
+```
+
+On Windows, double-click `build_jp_cache.bat` to run the default cache builder.
+
+Range Scan uses official/structured data for core fundamentals:
+- US: EDGAR local data
+- KR: KIS/DART
+- JP: `data/jp_fundamentals_cache.jsonl`
+
+Select one or more countries with the Range Scan checkboxes. SG/UK/AU remain available for lookup, but official fundamentals range scanning is not enabled for them yet.
 
 ## 설치와 실행
 ```
