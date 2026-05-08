@@ -38,6 +38,7 @@ SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 YAHOO_QUOTE_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 STOOQ_QUOTE_URL = "https://stooq.pl/q/l/"
+NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
 ASX_LISTED_COMPANIES_URL = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
 SEC_FORM_PRIORITY = ("10-K", "20-F", "40-F", "10-Q", "10-Q/A", "8-K", "6-K")
 EDGAR_REVENUE_KEYS = (
@@ -56,8 +57,11 @@ GLOBAL_MARKETS = {
     "AU": {"suffix": ".AX", "name": "Australia", "scan_env": "AU_RANGE_SCAN_TICKERS"},
 }
 JQUANTS_BASE_URL = "https://api.jquants.com"
+US_FUNDAMENTALS_CACHE_PATH = Path("data") / "us_fundamentals_cache.jsonl"
+KR_FUNDAMENTALS_CACHE_PATH = Path("data") / "kr_fundamentals_cache.jsonl"
 JP_FUNDAMENTALS_CACHE_PATH = Path("data") / "jp_fundamentals_cache.jsonl"
 UK_FUNDAMENTALS_CACHE_PATH = Path("data") / "uk_fundamentals_cache.jsonl"
+FUNDAMENTALS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
 REPORT_SCHEDULE = (
@@ -600,6 +604,13 @@ ACCOUNT_SYNONYMS = {
 }
 
 ACCOUNT_ALIAS_MAP = {normalize_name(alias): key for key, aliases in ACCOUNT_SYNONYMS.items() for alias in aliases}
+ACCOUNT_KEYS = tuple(ACCOUNT_SYNONYMS.keys())
+ACCOUNT_REVENUE_KEY = ACCOUNT_KEYS[0]
+ACCOUNT_OPERATING_INCOME_KEY = ACCOUNT_KEYS[1]
+ACCOUNT_NET_INCOME_KEY = ACCOUNT_KEYS[2]
+ACCOUNT_ASSETS_KEY = ACCOUNT_KEYS[3]
+ACCOUNT_LIABILITIES_KEY = ACCOUNT_KEYS[4]
+ACCOUNT_EQUITY_KEY = ACCOUNT_KEYS[5]
 
 
 def parse_amount(value) -> Optional[int]:
@@ -743,9 +754,9 @@ def _fetch_dart_annual_values(
     except Exception:
         single_entries = []
     combined = (single_entries or []) + (entries or [])
-    revenue_val = find_account_amount(combined, "매출액")
-    op_income_val = find_account_amount(combined, "영업이익")
-    net_income_val = find_account_amount(combined, "당기순이익")
+    revenue_val = find_account_amount(combined, ACCOUNT_REVENUE_KEY)
+    op_income_val = find_account_amount(combined, ACCOUNT_OPERATING_INCOME_KEY)
+    net_income_val = find_account_amount(combined, ACCOUNT_NET_INCOME_KEY)
     return revenue_val, op_income_val, net_income_val
 
 
@@ -983,7 +994,9 @@ def fetch_dart_financials(
         short_term_products = find_account_amount(combined, "단기금융상품")
         amortized_assets = find_account_amount(combined, "단기상각후원가금융자산")
         fvpl_assets = find_account_amount(combined, "단기당기손익-공정가치금융자산")
-        equity_value = find_account_amount(combined, "자본총계")
+        liabilities_value = find_account_amount(combined, ACCOUNT_LIABILITIES_KEY)
+        equity_value = find_account_amount(combined, ACCOUNT_EQUITY_KEY)
+        net_income_value = find_account_amount(combined, ACCOUNT_NET_INCOME_KEY)
 
         if cash_equivalents is not None:
             summary["현금및현금성자산"] = format_amount(cash_equivalents)
@@ -1014,6 +1027,13 @@ def fetch_dart_financials(
                 ib_debt_ratio_pct = (debt_value / equity_value) * 100
             except Exception:
                 ib_debt_ratio_pct = None
+
+        liabilities_ratio_pct = None
+        if liabilities_value is not None and equity_value not in (None, 0):
+            try:
+                liabilities_ratio_pct = (liabilities_value / equity_value) * 100
+            except Exception:
+                liabilities_ratio_pct = None
 
         float_shares = None
         try:
@@ -1064,13 +1084,18 @@ def fetch_dart_financials(
             "cash_equivalents": format_amount(cash_equivalents) if cash_equivalents is not None else "N/A",
             "liquid_funds": liquid_funds,
             "interest_bearing_debt": debt_value,
+            "liabilities": liabilities_value,
             "net_cash": net_cash,
             "net_cash_display": net_cash_display,
             "float_shares": float_shares,
             "float_shares_display": float_shares_display,
             "net_cash_per_share": net_cash_per_share,
+            "net_cash_per_share_value": net_cash_per_share_value,
             "net_cash_per_share_ratio": net_cash_per_share_ratio,
             "equity": equity_value,
+            "net_income": net_income_value,
+            "liabilities_ratio": f"{liabilities_ratio_pct:,.2f}" if liabilities_ratio_pct is not None else "N/A",
+            "liabilities_ratio_value": liabilities_ratio_pct,
             "interest_bearing_debt_ratio": ib_debt_ratio_text,
             "interest_bearing_debt_ratio_value": ib_debt_ratio_pct,
         }
@@ -1479,6 +1504,84 @@ def fetch_stooq_quote(ticker: str, yahoo_error: Optional[str] = None) -> Dict[st
         "currency": "USD",
         "source": "stooq",
     }
+
+
+def parse_money_value(value: Any) -> Optional[float]:
+    if value in (None, "", "-", "N/A", "NaN"):
+        return None
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text:
+        return None
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def nasdaq_symbol_keys(symbol: str) -> List[str]:
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return []
+    keys = [text]
+    for variant in (text.replace("-", "/"), text.replace("-", "."), text.replace(".", "-"), text.replace("/", "-")):
+        if variant and variant not in keys:
+            keys.append(variant)
+    return keys
+
+
+@lru_cache(maxsize=1)
+def fetch_nasdaq_screener_quotes() -> Dict[str, Dict[str, Optional[float]]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/",
+    }
+    resp = requests.get(
+        NASDAQ_SCREENER_URL,
+        params={"tableonly": "true", "download": "true"},
+        headers=headers,
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise EdgarError(f"Nasdaq screener quote request failed: HTTP {resp.status_code}")
+    try:
+        rows = resp.json().get("data", {}).get("rows") or []
+    except Exception as exc:
+        raise EdgarError(f"Invalid Nasdaq screener response: {exc}") from exc
+
+    quotes: Dict[str, Dict[str, Optional[float]]] = {}
+    for row in rows:
+        raw_symbol = str(row.get("symbol") or "").strip().upper()
+        if not raw_symbol:
+            continue
+        quote = {
+            "symbol": raw_symbol,
+            "price": parse_money_value(row.get("lastsale")),
+            "per": None,
+            "pbr": None,
+            "market_cap": parse_money_value(row.get("marketCap")),
+            "currency": "USD",
+            "source": "nasdaq_screener",
+        }
+        for key in nasdaq_symbol_keys(raw_symbol):
+            quotes.setdefault(key, quote)
+    return quotes
+
+
+def fetch_us_screener_quotes_batch(tickers: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    quote_map = fetch_nasdaq_screener_quotes()
+    quotes: Dict[str, Dict[str, Optional[float]]] = {}
+    for ticker in tickers or []:
+        symbol = yahoo_symbol_for_ticker(ticker).upper()
+        for key in nasdaq_symbol_keys(symbol):
+            quote = quote_map.get(key)
+            if quote:
+                quotes[symbol] = quote
+                break
+    return quotes
 
 
 def yahoo_raw(value: Any) -> Any:
@@ -2264,6 +2367,14 @@ def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[s
     }
 
 
+def format_cache_delta(record: Dict[str, Any], growth_key: str) -> str:
+    per_val = parse_float(record.get("per"))
+    growth_val = parse_float(record.get(growth_key))
+    if per_val is None or per_val <= 0 or growth_val is None:
+        return "N/A"
+    return f"{growth_val - per_val:,.2f}"
+
+
 def cache_record_to_scan_values(record: Dict[str, Any]) -> Tuple[Any, ...]:
     return (
         record.get("country", "JP"),
@@ -2273,9 +2384,9 @@ def cache_record_to_scan_values(record: Dict[str, Any]) -> Tuple[Any, ...]:
         record.get("pbr", "N/A"),
         record.get("liabilities_ratio", "N/A"),
         record.get("net_cash_per_share_ratio", "N/A"),
-        "N/A",
-        "N/A",
-        "N/A",
+        format_cache_delta(record, "sales_growth_5y_avg_pct"),
+        format_cache_delta(record, "op_growth_5y_avg_pct"),
+        format_cache_delta(record, "net_income_growth_5y_avg_pct"),
     )
 
 
@@ -2321,7 +2432,7 @@ def load_cached_codes(path: Path) -> set:
     return codes
 
 
-def load_jp_fundamentals_cache(path: Path = JP_FUNDAMENTALS_CACHE_PATH) -> List[Dict[str, Any]]:
+def load_fundamentals_cache(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     records = []
@@ -2334,21 +2445,56 @@ def load_jp_fundamentals_cache(path: Path = JP_FUNDAMENTALS_CACHE_PATH) -> List[
             except Exception:
                 continue
     return records
+
+
+def load_us_fundamentals_cache(path: Path = US_FUNDAMENTALS_CACHE_PATH) -> List[Dict[str, Any]]:
+    return load_fundamentals_cache(path)
+
+
+def load_kr_fundamentals_cache(path: Path = KR_FUNDAMENTALS_CACHE_PATH) -> List[Dict[str, Any]]:
+    return load_fundamentals_cache(path)
+
+
+def load_jp_fundamentals_cache(path: Path = JP_FUNDAMENTALS_CACHE_PATH) -> List[Dict[str, Any]]:
+    return load_fundamentals_cache(path)
 
 
 def load_uk_fundamentals_cache(path: Path = UK_FUNDAMENTALS_CACHE_PATH) -> List[Dict[str, Any]]:
+    return load_fundamentals_cache(path)
+
+
+def fundamentals_cache_path(country: str) -> Optional[Path]:
+    return {
+        "US": US_FUNDAMENTALS_CACHE_PATH,
+        "KR": KR_FUNDAMENTALS_CACHE_PATH,
+        "JP": JP_FUNDAMENTALS_CACHE_PATH,
+        "UK": UK_FUNDAMENTALS_CACHE_PATH,
+    }.get((country or "").upper())
+
+
+def load_country_fundamentals_cache(country: str) -> List[Dict[str, Any]]:
+    path = fundamentals_cache_path(country)
+    return load_fundamentals_cache(path) if path else []
+
+
+def fundamentals_cache_status(country: str, max_age_seconds: int = FUNDAMENTALS_CACHE_MAX_AGE_SECONDS) -> str:
+    path = fundamentals_cache_path(country)
+    if not path:
+        return f"{country} cache is not supported."
     if not path.exists():
-        return []
-    records = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                payload = json.loads(line)
-                if payload.get("code"):
-                    records.append(payload)
-            except Exception:
-                continue
-    return records
+        return f"{country} cache missing. Build it first."
+    try:
+        stat = path.stat()
+        if stat.st_size == 0:
+            return f"{country} cache empty. Rebuild it."
+        mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+        age_seconds = time.time() - stat.st_mtime
+    except Exception:
+        return f"{country} cache exists, but status could not be read."
+    timestamp = mtime.strftime("%Y-%m-%d %H:%M")
+    if age_seconds <= max_age_seconds:
+        return f"{country} cache ready (updated {timestamp})."
+    return f"{country} cache stale (updated {timestamp})."
 
 
 def cache_record_passes_filters(
@@ -2395,14 +2541,116 @@ def cache_record_passes_filters(
     )
 
 
-def enrich_jp_cache_records_with_yahoo(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def scan_cached_fundamentals_records(
+    country: str,
+    records: List[Dict[str, Any]],
+    per_min: Optional[float],
+    per_max: Optional[float],
+    pbr_min: Optional[float],
+    pbr_max: Optional[float],
+    debt_min: Optional[float],
+    debt_max: Optional[float],
+    ib_debt_min: Optional[float],
+    ib_debt_max: Optional[float],
+    ncsr_min: Optional[float],
+    ncsr_max: Optional[float],
+    sales_delta_min: Optional[float],
+    op_delta_min: Optional[float],
+    net_delta_min: Optional[float],
+    *,
+    quote_fetcher: Callable[[List[str]], Dict[str, Dict[str, Optional[float]]]] = fetch_yahoo_quotes_batch,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Tuple[Any, ...]], int, Optional[str]]:
+    enriched = enrich_cache_records_with_yahoo(
+        records,
+        country,
+        quote_fetcher=quote_fetcher,
+        progress_cb=progress_cb,
+    )
+    rows: List[Tuple[Any, ...]] = []
+    last_error = None
+    for record in enriched:
+        try:
+            if not cache_record_passes_filters(
+                record,
+                per_min,
+                per_max,
+                pbr_min,
+                pbr_max,
+                debt_min,
+                debt_max,
+                ib_debt_min,
+                ib_debt_max,
+                ncsr_min,
+                ncsr_max,
+                sales_delta_min,
+                op_delta_min,
+                net_delta_min,
+            ):
+                continue
+            rows.append(cache_record_to_scan_values(record))
+        except Exception as exc:
+            last_error = str(exc)
+    return rows, len(enriched), last_error
+
+
+def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str, Any]]) -> None:
+    price = quote.get("price") if quote else None
+    per_val = quote.get("per") if quote else None
+    pbr_val = quote.get("pbr") if quote else None
+    shares = parse_float(record.get("shares"))
+    if shares is None:
+        shares = parse_float(record.get("float_shares"))
+    net_income = parse_float(record.get("net_income"))
+    equity = parse_float(record.get("equity"))
+    market_cap = quote.get("market_cap") if quote else None
+    if market_cap is None:
+        market_cap = float(price) * shares if price is not None and shares else None
+
+    if per_val is None and market_cap is not None and net_income not in (None, 0):
+        try:
+            per_val = market_cap / net_income
+        except Exception:
+            per_val = None
+    if pbr_val is None and market_cap is not None and equity not in (None, 0):
+        try:
+            pbr_val = market_cap / equity
+        except Exception:
+            pbr_val = None
+
+    if price is not None:
+        record["price"] = clean_number(price)
+    if per_val is not None:
+        record["per"] = f"{per_val:,.2f}"
+    if pbr_val is not None:
+        record["pbr"] = f"{pbr_val:,.2f}"
+
+    net_cash_ps = parse_float(record.get("net_cash_per_share_value"))
+    if net_cash_ps is None:
+        net_cash_ps = parse_float(record.get("net_cash_per_share"))
+    if net_cash_ps is not None and price not in (None, 0):
+        try:
+            record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price)) * 100:,.2f}%"
+        except Exception:
+            pass
+    if quote and quote.get("source"):
+        record["quote_source"] = quote.get("source")
+
+
+def enrich_jp_cache_records_with_yahoo(
+    records: List[Dict[str, Any]],
+    quote_fetcher: Callable[[List[str]], Dict[str, Dict[str, Optional[float]]]] = fetch_yahoo_quotes_batch,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> List[Dict[str, Any]]:
     enriched = [dict(record) for record in records]
     code_to_record = {str(record.get("code") or "").strip(): record for record in enriched}
     symbols = [f"{code}.T" for code in code_to_record if code]
     for offset in range(0, len(symbols), 100):
         chunk = symbols[offset : offset + 100]
+        if progress_cb:
+            progress_cb(f"JP quotes... {offset}/{len(symbols)}")
         try:
-            quotes = fetch_yahoo_quotes_batch(chunk)
+            quotes = quote_fetcher(chunk)
         except Exception:
             quotes = {}
         for symbol in chunk:
@@ -2411,57 +2659,50 @@ def enrich_jp_cache_records_with_yahoo(records: List[Dict[str, Any]]) -> List[Di
             quote = quotes.get(symbol)
             if not record or not quote:
                 continue
-            price = quote.get("price")
-            per_val = quote.get("per")
-            pbr_val = quote.get("pbr")
-            record["price"] = clean_number(price) if price is not None else record.get("price", "N/A")
-            record["per"] = clean_number(per_val) if per_val is not None else record.get("per", "N/A")
-            record["pbr"] = clean_number(pbr_val) if pbr_val is not None else record.get("pbr", "N/A")
-            net_cash_ps = parse_float(record.get("net_cash_per_share_value")) or parse_float(record.get("net_cash_per_share"))
-            if net_cash_ps is not None and price not in (None, 0):
-                try:
-                    record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price)) * 100:,.2f}%"
-                except Exception:
-                    pass
+            apply_quote_to_cache_record(record, quote)
     return enriched
 
 
-def enrich_cache_records_with_yahoo(records: List[Dict[str, Any]], country: str) -> List[Dict[str, Any]]:
+def enrich_cache_records_with_yahoo(
+    records: List[Dict[str, Any]],
+    country: str,
+    quote_fetcher: Callable[[List[str]], Dict[str, Dict[str, Optional[float]]]] = fetch_yahoo_quotes_batch,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> List[Dict[str, Any]]:
     if country == "JP":
-        return enrich_jp_cache_records_with_yahoo(records)
+        return enrich_jp_cache_records_with_yahoo(records, quote_fetcher=quote_fetcher, progress_cb=progress_cb)
     enriched = [dict(record) for record in records]
-    symbol_to_record = {}
+    symbol_to_records: Dict[str, List[Dict[str, Any]]] = {}
     symbols = []
+    if country == "US" and quote_fetcher is fetch_yahoo_quotes_batch:
+        quote_fetcher = fetch_us_screener_quotes_batch
     for record in enriched:
         code = str(record.get("code") or "").strip().upper()
         if not code:
             continue
-        symbol = primary_yahoo_scan_symbol(code, country).upper()
-        symbols.append(symbol)
-        symbol_to_record[symbol] = record
+        for symbol in yahoo_scan_symbols(code, country):
+            symbol = symbol.upper()
+            symbols.append(symbol)
+            symbol_to_records.setdefault(symbol, []).append(record)
+    applied_record_ids = set()
     for offset in range(0, len(symbols), 100):
         chunk = symbols[offset : offset + 100]
+        if progress_cb:
+            progress_cb(f"{country} quotes... {min(offset + len(chunk), len(symbols))}/{len(symbols)}")
         try:
-            quotes = fetch_yahoo_quotes_batch(chunk)
+            quotes = quote_fetcher(chunk)
         except Exception:
             quotes = {}
         for symbol in chunk:
-            record = symbol_to_record.get(symbol)
             quote = quotes.get(symbol)
-            if not record or not quote:
+            if not quote:
                 continue
-            price = quote.get("price")
-            per_val = quote.get("per")
-            pbr_val = quote.get("pbr")
-            record["price"] = clean_number(price) if price is not None else record.get("price", "N/A")
-            record["per"] = clean_number(per_val) if per_val is not None else record.get("per", "N/A")
-            record["pbr"] = clean_number(pbr_val) if pbr_val is not None else record.get("pbr", "N/A")
-            net_cash_ps = parse_float(record.get("net_cash_per_share_value")) or parse_float(record.get("net_cash_per_share"))
-            if net_cash_ps is not None and price not in (None, 0):
-                try:
-                    record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price)) * 100:,.2f}%"
-                except Exception:
-                    pass
+            for record in symbol_to_records.get(symbol, []):
+                record_id = id(record)
+                if record_id in applied_record_ids:
+                    continue
+                apply_quote_to_cache_record(record, quote)
+                applied_record_ids.add(record_id)
     return enriched
 
 
@@ -3112,6 +3353,177 @@ def extract_edgar_scan_fundamentals(facts: Dict) -> Dict[str, Any]:
     }
 
 
+def us_fundamentals_to_cache_record(
+    ticker: str,
+    cik: str,
+    name: str,
+    fundamentals: Dict[str, Any],
+) -> Dict[str, Any]:
+    liabilities_ratio_value = fundamentals.get("liabilities_ratio_value")
+    ib_ratio_value = fundamentals.get("interest_bearing_debt_ratio_value")
+    net_cash = fundamentals.get("net_cash")
+    shares = fundamentals.get("shares")
+    net_cash_ps = fundamentals.get("net_cash_per_share_value")
+    return {
+        "country": "US",
+        "code": (ticker or "").strip().upper(),
+        "ticker": (ticker or "").strip().upper(),
+        "cik": cik,
+        "name": name or ticker,
+        "bsns_year": "-",
+        "reprt_code": "companyfacts",
+        "source_report": "EDGAR companyfacts",
+        "price": "N/A",
+        "per": "N/A",
+        "pbr": "N/A",
+        "liabilities": fundamentals.get("liabilities"),
+        "liabilities_ratio": f"{liabilities_ratio_value:,.2f}" if liabilities_ratio_value is not None else "N/A",
+        "liabilities_ratio_value": liabilities_ratio_value,
+        "interest_bearing_debt": fundamentals.get("interest_bearing_debt"),
+        "interest_bearing_debt_ratio": f"{ib_ratio_value:,.2f}" if ib_ratio_value is not None else "N/A",
+        "interest_bearing_debt_ratio_value": ib_ratio_value,
+        "liquid_funds": fundamentals.get("liquid_funds_total"),
+        "net_cash": net_cash,
+        "net_cash_display": format_amount(net_cash) if net_cash is not None else "N/A",
+        "float_shares": shares,
+        "shares": shares,
+        "float_shares_display": format_amount(shares) if shares is not None else None,
+        "net_cash_per_share": format_per_share(net_cash, shares),
+        "net_cash_per_share_value": net_cash_ps,
+        "net_cash_per_share_ratio": "N/A",
+        "net_income": fundamentals.get("net_income"),
+        "equity": fundamentals.get("equity"),
+        "sales_growth_5y_avg_pct": fundamentals.get("sales_growth_5y_avg_pct"),
+        "op_growth_5y_avg_pct": fundamentals.get("op_growth_5y_avg_pct"),
+        "net_income_growth_5y_avg_pct": fundamentals.get("net_income_growth_5y_avg_pct"),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def kr_detail_to_cache_record(stock_code: str, corp_code: str, corp_name: str, detail: Dict[str, Any]) -> Dict[str, Any]:
+    liabilities_ratio_value = detail.get("liabilities_ratio_value")
+    ib_ratio_value = detail.get("interest_bearing_debt_ratio_value")
+    float_shares = detail.get("float_shares")
+    return {
+        "country": "KR",
+        "code": normalize_scan_code_for_country(stock_code, "KR"),
+        "ticker": normalize_scan_code_for_country(stock_code, "KR"),
+        "corp_code": corp_code,
+        "name": detail.get("corp_name") or corp_name or stock_code,
+        "bsns_year": detail.get("bsns_year", "-"),
+        "reprt_code": detail.get("reprt_code", "-"),
+        "source_report": "OpenDART",
+        "price": "N/A",
+        "per": "N/A",
+        "pbr": "N/A",
+        "liabilities": detail.get("liabilities"),
+        "liabilities_ratio": detail.get("liabilities_ratio", "N/A"),
+        "liabilities_ratio_value": liabilities_ratio_value,
+        "interest_bearing_debt": detail.get("interest_bearing_debt"),
+        "interest_bearing_debt_ratio": detail.get("interest_bearing_debt_ratio", "N/A"),
+        "interest_bearing_debt_ratio_value": ib_ratio_value,
+        "liquid_funds": detail.get("liquid_funds"),
+        "net_cash": detail.get("net_cash"),
+        "net_cash_display": detail.get("net_cash_display", "N/A"),
+        "float_shares": float_shares,
+        "shares": float_shares,
+        "float_shares_display": detail.get("float_shares_display"),
+        "net_cash_per_share": detail.get("net_cash_per_share", "N/A"),
+        "net_cash_per_share_value": detail.get("net_cash_per_share_value"),
+        "net_cash_per_share_ratio": "N/A",
+        "net_income": detail.get("net_income"),
+        "equity": detail.get("equity"),
+        "sales_growth_5y": detail.get("sales_growth_5y", "N/A"),
+        "op_growth_5y": detail.get("op_growth_5y", "N/A"),
+        "net_income_growth_5y": detail.get("net_income_growth_5y", "N/A"),
+        "sales_growth_5y_avg_pct": detail.get("sales_growth_5y_avg_pct"),
+        "op_growth_5y_avg_pct": detail.get("op_growth_5y_avg_pct"),
+        "net_income_growth_5y_avg_pct": detail.get("net_income_growth_5y_avg_pct"),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def build_us_fundamentals_cache(
+    output_path: Path = US_FUNDAMENTALS_CACHE_PATH,
+    *,
+    force: bool = False,
+) -> Tuple[int, int, Optional[str]]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_codes = set() if force else load_cached_codes(output_path)
+    index = ensure_submissions_index()
+    entries = index.get("entries", []) if isinstance(index, dict) else []
+    targets = []
+    for meta in entries:
+        try:
+            if meta.get("is_foreign") or meta.get("is_fund"):
+                continue
+            if not meta.get("has_companyfacts"):
+                continue
+            ticker = (meta.get("primary_ticker") or "").strip().upper()
+            cik = str(meta.get("cik") or "").strip()
+            if ticker and cik and (force or ticker not in cached_codes):
+                targets.append({"ticker": ticker, "cik": cik, "name": (meta.get("name") or ticker).strip()})
+        except Exception:
+            continue
+
+    mode = "w" if force else "a"
+    written = 0
+    last_error = None
+    with output_path.open(mode, encoding="utf-8") as f:
+        for idx, item in enumerate(targets, start=1):
+            try:
+                facts = load_company_facts(item["cik"])
+                fundamentals = extract_edgar_scan_fundamentals(facts)
+                record = us_fundamentals_to_cache_record(
+                    item["ticker"],
+                    item["cik"],
+                    item["name"],
+                    fundamentals,
+                )
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                written += 1
+                print(f"[{idx}/{len(targets)}] cached US {item['ticker']} {item['name']}")
+            except Exception as exc:
+                last_error = str(exc)
+                print(f"[{idx}/{len(targets)}] failed US {item.get('ticker')}: {exc}", file=sys.stderr)
+    return written, len(targets), last_error
+
+
+def build_kr_fundamentals_cache(
+    output_path: Path = KR_FUNDAMENTALS_CACHE_PATH,
+    *,
+    force: bool = False,
+) -> Tuple[int, int, Optional[str]]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_codes = set() if force else load_cached_codes(output_path)
+    _, stock_map, code_to_name = load_dart_corp_map()
+    krx_codes = set(load_name_map().values())
+    targets = [
+        (stock_code, corp_code)
+        for stock_code, corp_code in sorted(stock_map.items())
+        if stock_code in krx_codes and (force or stock_code not in cached_codes)
+    ]
+
+    mode = "w" if force else "a"
+    written = 0
+    last_error = None
+    with output_path.open(mode, encoding="utf-8") as f:
+        for idx, (stock_code, corp_code) in enumerate(targets, start=1):
+            corp_name = code_to_name.get(corp_code, stock_code)
+            try:
+                detail = fetch_dart_financials(corp_code)
+                record = kr_detail_to_cache_record(stock_code, corp_code, corp_name, detail)
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                written += 1
+                print(f"[{idx}/{len(targets)}] cached KR {stock_code} {record.get('name')}")
+            except Exception as exc:
+                last_error = str(exc)
+                print(f"[{idx}/{len(targets)}] failed KR {stock_code}: {exc}", file=sys.stderr)
+    return written, len(targets), last_error
+
+
 def fetch_edgar_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, str]]:
     company = resolve_edgar_company(user_text)
     ticker = company.get("ticker") or user_text
@@ -3553,21 +3965,28 @@ def build_gui():
         modal.geometry("980x580")
         modal.resizable(True, True)
 
-        per_min_var = tk.StringVar()
-        per_max_var = tk.StringVar()
-        pbr_min_var = tk.StringVar()
-        pbr_max_var = tk.StringVar()
-        debt_min_var = tk.StringVar()
-        debt_max_var = tk.StringVar()
-        ib_debt_min_var = tk.StringVar()
-        ib_debt_max_var = tk.StringVar()
-        ncs_ratio_min_var = tk.StringVar()
-        ncs_ratio_max_var = tk.StringVar()
-        sales_delta_min_var = tk.StringVar()
-        op_delta_min_var = tk.StringVar()
-        net_delta_min_var = tk.StringVar()
+        per_min_var = tk.StringVar(value="0.1")
+        per_max_var = tk.StringVar(value="15")
+        pbr_min_var = tk.StringVar(value="0.1")
+        pbr_max_var = tk.StringVar(value="1.5")
+        debt_min_var = tk.StringVar(value="0")
+        debt_max_var = tk.StringVar(value="50")
+        ib_debt_min_var = tk.StringVar(value="all")
+        ib_debt_max_var = tk.StringVar(value="all")
+        ncs_ratio_min_var = tk.StringVar(value="40")
+        ncs_ratio_max_var = tk.StringVar(value="500000")
+        sales_delta_min_var = tk.StringVar(value="0")
+        op_delta_min_var = tk.StringVar(value="0")
+        net_delta_min_var = tk.StringVar(value="0")
         country_checks = {country: tk.BooleanVar(value=(country == selected_country)) for country in COUNTRY_CHOICES}
-        scan_status_var = tk.StringVar(value="범위를 입력하거나 All을 체크 후 Scan을 눌러주세요.")
+        initial_cache_status = (
+            "KR uses the official live scan path until the KR cache is complete."
+            if selected_country == "KR"
+            else fundamentals_cache_status(selected_country)
+            if fundamentals_cache_path(selected_country)
+            else "범위를 입력하거나 All을 체크 후 Scan을 눌러주세요."
+        )
+        scan_status_var = tk.StringVar(value=initial_cache_status)
 
         controls = ttk.Frame(modal, padding=(8, 8))
         controls.pack(fill="x")
@@ -3599,6 +4018,11 @@ def build_gui():
                     min_entry.configure(state="normal")
                     max_entry.configure(state="normal")
 
+            if str(min_var.get()).strip().lower() == "all" and str(max_var.get()).strip().lower() == "all":
+                all_var.set(True)
+                min_entry.configure(state="disabled")
+                max_entry.configure(state="disabled")
+
             ttk.Checkbutton(controls, text="All", variable=all_var, command=toggle_all).grid(row=row, column=4, sticky="w")
 
         def add_min_field(row, label, min_var):
@@ -3619,6 +4043,10 @@ def build_gui():
                     restore_min = prev.get("min", "")
                     min_var.set("" if str(restore_min).strip().lower() == "all" else restore_min)
                     min_entry.configure(state="normal")
+
+            if str(min_var.get()).strip().lower() == "all":
+                all_var.set(True)
+                min_entry.configure(state="disabled")
 
             ttk.Checkbutton(controls, text="All", variable=all_var, command=toggle_all).grid(
                 row=row, column=4, sticky="w"
@@ -3825,42 +4253,37 @@ def build_gui():
                     last_error = None
 
                     for scan_country in countries:
-                        if scan_country in ("JP", "UK"):
-                            records = load_jp_fundamentals_cache() if scan_country == "JP" else load_uk_fundamentals_cache()
+                        if scan_country in ("US", "JP", "UK"):
+                            set_scan_status(fundamentals_cache_status(scan_country))
+                            records = load_country_fundamentals_cache(scan_country)
                             if not records:
-                                cache_name = "JP" if scan_country == "JP" else "UK"
-                                set_scan_status(f"{cache_name} cache not found. Build the fundamentals cache first.")
+                                set_scan_status(f"{scan_country} cache not found. Build the fundamentals cache first.")
                                 continue
-                            set_scan_status(f"{scan_country} cache loaded; fetching Yahoo prices...")
-                            records = enrich_cache_records_with_yahoo(records, scan_country)
-                            total = len(records)
-                            matched = 0
-                            for processed, record in enumerate(records, start=1):
-                                try:
-                                    if not cache_record_passes_filters(
-                                        record,
-                                        per_min,
-                                        per_max,
-                                        pbr_min,
-                                        pbr_max,
-                                        debt_min,
-                                        debt_max,
-                                        ib_debt_min,
-                                        ib_debt_max,
-                                        ncsr_min,
-                                        ncsr_max,
-                                        sales_delta_min,
-                                        op_delta_min,
-                                        net_delta_min,
-                                    ):
-                                        continue
-                                    matched += 1
-                                    matched_total += 1
-                                    root.after(0, lambda vals=cache_record_to_scan_values(record): tree.insert("", "end", values=vals))
-                                except Exception as exc:
-                                    last_error = str(exc)
-                                if processed % 200 == 0 or processed == total:
-                                    set_scan_status(f"{scan_country} cache scanning... {processed}/{total}, matched {matched}")
+                            set_scan_status(f"{scan_country} cache loaded; fetching batch quotes...")
+                            rows, total, cache_error = scan_cached_fundamentals_records(
+                                scan_country,
+                                records,
+                                per_min,
+                                per_max,
+                                pbr_min,
+                                pbr_max,
+                                debt_min,
+                                debt_max,
+                                ib_debt_min,
+                                ib_debt_max,
+                                ncsr_min,
+                                ncsr_max,
+                                sales_delta_min,
+                                op_delta_min,
+                                net_delta_min,
+                                progress_cb=set_scan_status,
+                            )
+                            if cache_error:
+                                last_error = cache_error
+                            for row_values in rows:
+                                matched_total += 1
+                                root.after(0, lambda vals=row_values: tree.insert("", "end", values=vals))
+                            set_scan_status(f"{scan_country} cache scanning done: {len(rows)}/{total} matched")
                             processed_total += total
                             continue
 
@@ -4524,6 +4947,9 @@ if __name__ == "__main__":
     parser.add_argument("--dart-year", dest="dart_year", help="Business year (YYYY) for DART lookup")
     parser.add_argument("--symbol", help="Symbol or code to use in CLI mode")
     parser.add_argument("--country", choices=COUNTRY_CHOICES, default="KR", help="Country for CLI mode")
+    parser.add_argument("--build-us-cache", action="store_true", help="Build/update US fundamentals cache from local EDGAR companyfacts")
+    parser.add_argument("--build-kr-cache", action="store_true", help="Build/update KR fundamentals cache from OpenDART")
+    parser.add_argument("--force-cache-refresh", action="store_true", help="Rebuild the selected fundamentals cache from scratch")
     parser.add_argument("--build-jp-cache", action="store_true", help="Build/update JP fundamentals cache from J-Quants")
     parser.add_argument("--jp-cache-output", default=str(JP_FUNDAMENTALS_CACHE_PATH), help="JP cache output JSONL path")
     parser.add_argument("--jp-cache-limit", type=int, help="Limit JP cache build to N uncached symbols")
@@ -4543,7 +4969,7 @@ if __name__ == "__main__":
             inputs=args.uk_cache_input,
             tickers=args.uk_cache_ticker,
             names=args.uk_cache_name,
-            force=args.uk_cache_force,
+            force=args.uk_cache_force or args.force_cache_refresh,
         )
         print(f"UK cache complete: wrote {written}/{total} documents to {args.uk_cache_output}")
         if last_error:
@@ -4554,10 +4980,30 @@ if __name__ == "__main__":
         written, total, last_error = build_jp_fundamentals_cache(
             Path(args.jp_cache_output),
             limit=args.jp_cache_limit,
-            force=args.jp_cache_force,
+            force=args.jp_cache_force or args.force_cache_refresh,
             include_price=args.jp_cache_include_price,
         )
         print(f"JP cache complete: wrote {written}/{total} rows to {args.jp_cache_output}")
+        if last_error:
+            print(f"Last error: {last_error}", file=sys.stderr)
+        sys.exit(0 if written or total == 0 else 1)
+
+    if args.build_us_cache:
+        written, total, last_error = build_us_fundamentals_cache(
+            US_FUNDAMENTALS_CACHE_PATH,
+            force=args.force_cache_refresh,
+        )
+        print(f"US cache complete: wrote {written}/{total} rows to {US_FUNDAMENTALS_CACHE_PATH}")
+        if last_error:
+            print(f"Last error: {last_error}", file=sys.stderr)
+        sys.exit(0 if written or total == 0 else 1)
+
+    if args.build_kr_cache:
+        written, total, last_error = build_kr_fundamentals_cache(
+            KR_FUNDAMENTALS_CACHE_PATH,
+            force=args.force_cache_refresh,
+        )
+        print(f"KR cache complete: wrote {written}/{total} rows to {KR_FUNDAMENTALS_CACHE_PATH}")
         if last_error:
             print(f"Last error: {last_error}", file=sys.stderr)
         sys.exit(0 if written or total == 0 else 1)

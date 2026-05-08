@@ -48,6 +48,15 @@ python app.py --build-jp-cache
 ```
 By default this stores official financial fundamentals only. Range Scan fetches current JP prices from Yahoo in batches and combines them with the cache.
 
+## US/KR fundamentals cache
+US and KR Range Scan use official fundamentals caches plus live batch quotes. Build or refresh them once per day:
+```
+python app.py --build-us-cache --force-cache-refresh
+python app.py --build-kr-cache --force-cache-refresh
+```
+
+Without `--force-cache-refresh`, cache builders append only uncached symbols. Range Scan does not rebuild stale caches automatically; the GUI shows whether each cache is missing, fresh, or older than 24 hours.
+
 Useful options:
 ```
 python app.py --build-jp-cache --jp-cache-limit 10
@@ -74,8 +83,8 @@ python app.py --build-uk-cache --uk-cache-input C:\data\uk\vod.zip --uk-cache-ti
 By default this writes `data/uk_fundamentals_cache.jsonl`. Range Scan combines this official fundamentals cache with Yahoo batch quotes for price/PER/PBR only.
 
 Range Scan uses official/structured data for core fundamentals:
-- US: EDGAR local data
-- KR: KIS/DART
+- US: `data/us_fundamentals_cache.jsonl` from local EDGAR companyfacts
+- KR: `data/kr_fundamentals_cache.jsonl` from OpenDART
 - JP: `data/jp_fundamentals_cache.jsonl`
 - UK: `data/uk_fundamentals_cache.jsonl` from official ESEF/iXBRL files
 
