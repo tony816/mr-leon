@@ -58,12 +58,28 @@ python app.py --build-jp-cache --jp-cache-output data/jp_fundamentals_cache.json
 
 On Windows, double-click `build_jp_cache.bat` to run the default cache builder.
 
+## UK fundamentals cache MVP
+UK Range Scan uses a local official ESEF/iXBRL cache. This first implementation does not scrape FCA NSM automatically; provide downloaded official structured AFR files (`.zip`, `.xhtml`, `.xml`) or a directory containing them.
+
+Example:
+```
+python app.py --build-uk-cache --uk-cache-input C:\data\uk\vodafone-2025-esef.zip --uk-cache-ticker VOD --uk-cache-name "Vodafone Group"
+```
+
+Multiple inputs can be repeated in the same order:
+```
+python app.py --build-uk-cache --uk-cache-input C:\data\uk\vod.zip --uk-cache-ticker VOD --uk-cache-input C:\data\uk\bp.zip --uk-cache-ticker BP
+```
+
+By default this writes `data/uk_fundamentals_cache.jsonl`. Range Scan combines this official fundamentals cache with Yahoo batch quotes for price/PER/PBR only.
+
 Range Scan uses official/structured data for core fundamentals:
 - US: EDGAR local data
 - KR: KIS/DART
 - JP: `data/jp_fundamentals_cache.jsonl`
+- UK: `data/uk_fundamentals_cache.jsonl` from official ESEF/iXBRL files
 
-Select one or more countries with the Range Scan checkboxes. SG/UK/AU remain available for lookup, but official fundamentals range scanning is not enabled for them yet.
+Select one or more countries with the Range Scan checkboxes. SG/AU remain available for lookup, but official fundamentals range scanning is not enabled for them yet.
 
 ## 설치와 실행
 ```

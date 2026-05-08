@@ -57,6 +57,7 @@ GLOBAL_MARKETS = {
 }
 JQUANTS_BASE_URL = "https://api.jquants.com"
 JP_FUNDAMENTALS_CACHE_PATH = Path("data") / "jp_fundamentals_cache.jsonl"
+UK_FUNDAMENTALS_CACHE_PATH = Path("data") / "uk_fundamentals_cache.jsonl"
 
 # (reprt_code, release_month, release_year_offset_from_bsns_year)
 REPORT_SCHEDULE = (
@@ -2335,6 +2336,21 @@ def load_jp_fundamentals_cache(path: Path = JP_FUNDAMENTALS_CACHE_PATH) -> List[
     return records
 
 
+def load_uk_fundamentals_cache(path: Path = UK_FUNDAMENTALS_CACHE_PATH) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    records = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                payload = json.loads(line)
+                if payload.get("code"):
+                    records.append(payload)
+            except Exception:
+                continue
+    return records
+
+
 def cache_record_passes_filters(
     record: Dict[str, Any],
     per_min: Optional[float],
@@ -2408,6 +2424,323 @@ def enrich_jp_cache_records_with_yahoo(records: List[Dict[str, Any]]) -> List[Di
                 except Exception:
                     pass
     return enriched
+
+
+def enrich_cache_records_with_yahoo(records: List[Dict[str, Any]], country: str) -> List[Dict[str, Any]]:
+    if country == "JP":
+        return enrich_jp_cache_records_with_yahoo(records)
+    enriched = [dict(record) for record in records]
+    symbol_to_record = {}
+    symbols = []
+    for record in enriched:
+        code = str(record.get("code") or "").strip().upper()
+        if not code:
+            continue
+        symbol = primary_yahoo_scan_symbol(code, country).upper()
+        symbols.append(symbol)
+        symbol_to_record[symbol] = record
+    for offset in range(0, len(symbols), 100):
+        chunk = symbols[offset : offset + 100]
+        try:
+            quotes = fetch_yahoo_quotes_batch(chunk)
+        except Exception:
+            quotes = {}
+        for symbol in chunk:
+            record = symbol_to_record.get(symbol)
+            quote = quotes.get(symbol)
+            if not record or not quote:
+                continue
+            price = quote.get("price")
+            per_val = quote.get("per")
+            pbr_val = quote.get("pbr")
+            record["price"] = clean_number(price) if price is not None else record.get("price", "N/A")
+            record["per"] = clean_number(per_val) if per_val is not None else record.get("per", "N/A")
+            record["pbr"] = clean_number(pbr_val) if pbr_val is not None else record.get("pbr", "N/A")
+            net_cash_ps = parse_float(record.get("net_cash_per_share_value")) or parse_float(record.get("net_cash_per_share"))
+            if net_cash_ps is not None and price not in (None, 0):
+                try:
+                    record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price)) * 100:,.2f}%"
+                except Exception:
+                    pass
+    return enriched
+
+
+def _local_name(tag: str) -> str:
+    text = str(tag or "")
+    if "}" in text:
+        text = text.rsplit("}", 1)[-1]
+    if ":" in text:
+        text = text.rsplit(":", 1)[-1]
+    return text
+
+
+def _parse_xbrl_number(value: Any, scale: Optional[str] = None, sign: Optional[str] = None) -> Optional[float]:
+    if value in (None, "", "-", "NaN"):
+        return None
+    text = re.sub(r"\s+", "", str(value)).replace(",", "")
+    if not text:
+        return None
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    try:
+        number = float(text)
+    except Exception:
+        return None
+    try:
+        if scale not in (None, ""):
+            number *= 10 ** int(scale)
+    except Exception:
+        pass
+    if str(sign or "").strip() == "-":
+        number = -abs(number)
+    return number
+
+
+def _parse_xbrl_xml(xml_text: str) -> Dict[str, Any]:
+    parser = ET.XMLParser()
+    root = ET.fromstring(xml_text.encode("utf-8"), parser=parser)
+    contexts: Dict[str, Dict[str, Any]] = {}
+    units: Dict[str, str] = {}
+    facts: Dict[str, List[Dict[str, Any]]] = {}
+
+    for elem in root.iter():
+        lname = _local_name(elem.tag)
+        if lname == "context":
+            context_id = elem.attrib.get("id")
+            if not context_id:
+                continue
+            ctx: Dict[str, Any] = {}
+            for child in elem.iter():
+                child_name = _local_name(child.tag)
+                text = (child.text or "").strip()
+                if child_name == "instant":
+                    ctx["instant"] = text
+                    ctx["year"] = _year_from_iso_date(text)
+                elif child_name == "startDate":
+                    ctx["start"] = text
+                elif child_name == "endDate":
+                    ctx["end"] = text
+                    ctx["year"] = _year_from_iso_date(text)
+            contexts[context_id] = ctx
+        elif lname == "unit":
+            unit_id = elem.attrib.get("id")
+            if not unit_id:
+                continue
+            measures = []
+            for child in elem.iter():
+                if _local_name(child.tag) == "measure" and child.text:
+                    measures.append(_local_name(child.text.strip()))
+            units[unit_id] = ",".join(measures)
+
+    for elem in root.iter():
+        lname = _local_name(elem.tag)
+        concept = elem.attrib.get("name") if lname in ("nonFraction", "nonNumeric") else elem.tag
+        if not concept:
+            continue
+        concept_name = _local_name(concept)
+        if not concept_name or concept_name in ("html", "body", "div", "span", "context", "unit", "measure"):
+            continue
+        context_ref = elem.attrib.get("contextRef")
+        unit_ref = elem.attrib.get("unitRef")
+        if not context_ref:
+            continue
+        value = _parse_xbrl_number("".join(elem.itertext()), elem.attrib.get("scale"), elem.attrib.get("sign"))
+        if value is None:
+            continue
+        ctx = contexts.get(context_ref, {})
+        facts.setdefault(concept_name, []).append(
+            {
+                "value": value,
+                "year": ctx.get("year"),
+                "end": ctx.get("end") or ctx.get("instant"),
+                "start": ctx.get("start"),
+                "unit": units.get(unit_ref or "", unit_ref or ""),
+            }
+        )
+
+    return {"facts": facts}
+
+
+def _read_esef_documents(input_path: Path) -> List[Tuple[str, str]]:
+    if input_path.is_dir():
+        docs = []
+        for child in input_path.rglob("*"):
+            if child.suffix.lower() in (".html", ".xhtml", ".xml"):
+                docs.extend(_read_esef_documents(child))
+            elif child.suffix.lower() == ".zip":
+                docs.extend(_read_esef_documents(child))
+        return docs
+    if input_path.suffix.lower() == ".zip":
+        docs = []
+        with zipfile.ZipFile(input_path) as zf:
+            for name in zf.namelist():
+                if name.lower().endswith((".html", ".xhtml", ".xml")):
+                    docs.append((name, zf.read(name).decode("utf-8", errors="ignore")))
+        return docs
+    return [(input_path.name, input_path.read_text(encoding="utf-8", errors="ignore"))]
+
+
+def _fact_latest(facts: Dict[str, List[Dict[str, Any]]], names: Tuple[str, ...]) -> Optional[float]:
+    candidates = []
+    for name in names:
+        for fact in facts.get(name, []):
+            year = fact.get("year") or 0
+            end = _parse_iso_date(fact.get("end") or "")
+            candidates.append((year, end, fact.get("value")))
+    candidates = [c for c in candidates if c[2] is not None]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: (c[0], c[1]))[2]
+
+
+def _fact_series(facts: Dict[str, List[Dict[str, Any]]], names: Tuple[str, ...]) -> Dict[int, float]:
+    series: Dict[int, Tuple[int, float]] = {}
+    for name in names:
+        for fact in facts.get(name, []):
+            year = fact.get("year")
+            value = fact.get("value")
+            if not year or value is None:
+                continue
+            end = _parse_iso_date(fact.get("end") or "")
+            existing = series.get(year)
+            if existing is None or end > existing[0]:
+                series[year] = (end, value)
+    return {year: value for year, (_, value) in series.items()}
+
+
+UK_REVENUE_TAGS = ("Revenue", "RevenueFromContractsWithCustomers", "RevenueFromContractsWithCustomersExcludingAssessedTax")
+UK_OP_INCOME_TAGS = ("OperatingProfitLoss", "ProfitLossFromOperatingActivities", "OperatingProfit")
+UK_NET_INCOME_TAGS = ("ProfitLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLossFromContinuingOperations")
+UK_CASH_TAGS = ("CashAndCashEquivalents", "CashAndCashEquivalentsAtCarryingValue")
+UK_EQUITY_TAGS = ("Equity", "EquityAttributableToOwnersOfParent", "TotalEquity")
+UK_LIABILITIES_TAGS = ("Liabilities", "TotalLiabilities")
+UK_DEBT_TAGS = (
+    "Borrowings",
+    "CurrentBorrowings",
+    "NoncurrentBorrowings",
+    "LoansAndBorrowings",
+    "CurrentLoansAndBorrowings",
+    "NoncurrentLoansAndBorrowings",
+    "LeaseLiabilities",
+    "CurrentLeaseLiabilities",
+    "NoncurrentLeaseLiabilities",
+)
+UK_SHARES_TAGS = ("NumberOfSharesOutstanding", "WeightedAverageNumberOfOrdinarySharesOutstanding")
+
+
+def uk_facts_to_cache_record(code: str, name: str, source: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    facts = parsed.get("facts") or {}
+    revenue = _fact_latest(facts, UK_REVENUE_TAGS)
+    op_income = _fact_latest(facts, UK_OP_INCOME_TAGS)
+    net_income = _fact_latest(facts, UK_NET_INCOME_TAGS)
+    cash_val = _fact_latest(facts, UK_CASH_TAGS)
+    equity = _fact_latest(facts, UK_EQUITY_TAGS)
+    liabilities = _fact_latest(facts, UK_LIABILITIES_TAGS)
+    debt_values = [_fact_latest(facts, (tag,)) for tag in UK_DEBT_TAGS]
+    debt_values = [v for v in debt_values if v is not None]
+    debt_val = sum(debt_values) if debt_values else None
+    shares = _fact_latest(facts, UK_SHARES_TAGS)
+
+    net_cash, debt_used = compute_net_cash(
+        int(cash_val) if cash_val is not None else None,
+        int(debt_val) if debt_val is not None else None,
+        assume_zero_debt_when_missing=ASSUME_ZERO_DEBT_WHEN_MISSING,
+    )
+    liabilities_ratio = (liabilities / equity * 100) if liabilities is not None and equity not in (None, 0) else None
+    debt_ratio = (debt_used / equity * 100) if debt_used is not None and equity not in (None, 0) else None
+    net_cash_ps = (net_cash / shares) if net_cash is not None and shares not in (None, 0) else None
+
+    sales_avg, sales_count, sales_transitions = compute_yoy_average_stats(_fact_series(facts, UK_REVENUE_TAGS), 5)
+    op_avg, op_count, op_transitions = compute_yoy_average_stats(_fact_series(facts, UK_OP_INCOME_TAGS), 5)
+    net_avg, net_count, net_transitions = compute_yoy_average_stats(_fact_series(facts, UK_NET_INCOME_TAGS), 5)
+
+    years = [fact.get("year") for entries in facts.values() for fact in entries if fact.get("year")]
+    bsns_year = str(max(years)) if years else "-"
+    return {
+        "country": "UK",
+        "code": normalize_scan_code_for_country(code, "UK"),
+        "name": name or code,
+        "price": "N/A",
+        "per": "N/A",
+        "pbr": "N/A",
+        "liabilities_ratio": f"{liabilities_ratio:,.2f}" if liabilities_ratio is not None else "N/A",
+        "interest_bearing_debt_ratio": f"{debt_ratio:,.2f}" if debt_ratio is not None else "N/A",
+        "net_cash_per_share": format_per_share(net_cash, int(shares) if shares else None),
+        "net_cash_per_share_ratio": "N/A",
+        "net_cash_per_share_value": net_cash_ps,
+        "sales": format_amount(int(revenue)) if revenue is not None else "N/A",
+        "op_income": format_amount(int(op_income)) if op_income is not None else "N/A",
+        "equity": format_amount(int(equity)) if equity is not None else "N/A",
+        "sales_growth_5y": build_yoy_average_text(sales_avg, sales_count, sales_transitions),
+        "op_growth_5y": build_yoy_average_text(op_avg, op_count, op_transitions),
+        "net_income_growth_5y": build_yoy_average_text(net_avg, net_count, net_transitions),
+        "sales_growth_5y_avg_pct": sales_avg,
+        "op_growth_5y_avg_pct": op_avg,
+        "net_income_growth_5y_avg_pct": net_avg,
+        "liabilities_ratio_value": liabilities_ratio,
+        "interest_bearing_debt_ratio_value": debt_ratio,
+        "net_cash": net_cash,
+        "quote_source": "yahoo",
+        "fundamentals_source": "official-esef",
+        "source_file": source,
+        "bsns_year": bsns_year,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def build_uk_fundamentals_cache(
+    output_path: Path = UK_FUNDAMENTALS_CACHE_PATH,
+    *,
+    inputs: Optional[List[str]] = None,
+    tickers: Optional[List[str]] = None,
+    names: Optional[List[str]] = None,
+    force: bool = False,
+) -> Tuple[int, int, Optional[str]]:
+    input_list = [item for item in (inputs or []) if item]
+    if not input_list:
+        input_list = [item for item in re.split(r"[;]+", os.getenv("UK_ESEF_INPUTS", "")) if item.strip()]
+    if not input_list:
+        raise OfficialDataError("Provide --uk-cache-input or set UK_ESEF_INPUTS to ESEF .zip/.xhtml/.xml paths.")
+
+    ticker_list = [normalize_scan_code_for_country(t, "UK") for t in (tickers or []) if t]
+    if not ticker_list:
+        ticker_list = [normalize_scan_code_for_country(t, "UK") for t in env_ticker_list("UK_RANGE_SCAN_TICKERS")]
+    name_list = [n.strip() for n in (names or []) if n.strip()]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_codes = set() if force else load_cached_codes(output_path)
+    mode = "w" if force else "a"
+    written = 0
+    total = 0
+    last_error = None
+    with output_path.open(mode, encoding="utf-8") as out:
+        for input_idx, raw_path in enumerate(input_list):
+            input_path = Path(raw_path.strip().strip('"'))
+            try:
+                documents = _read_esef_documents(input_path)
+            except Exception as exc:
+                last_error = str(exc)
+                print(f"failed UK input {input_path}: {exc}", file=sys.stderr)
+                continue
+            for doc_idx, (source, text) in enumerate(documents):
+                total += 1
+                code = ticker_list[input_idx] if input_idx < len(ticker_list) else input_path.stem.upper()
+                if code in cached_codes:
+                    continue
+                name = name_list[input_idx] if input_idx < len(name_list) else code
+                try:
+                    parsed = _parse_xbrl_xml(text)
+                    record = uk_facts_to_cache_record(code, name, source, parsed)
+                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    out.flush()
+                    cached_codes.add(code)
+                    written += 1
+                    print(f"[{written}] cached UK {code} from {source}")
+                    break
+                except Exception as exc:
+                    last_error = str(exc)
+                    print(f"failed UK document {source}: {exc}", file=sys.stderr)
+    return written, total, last_error
 
 
 def build_jp_fundamentals_cache(
@@ -3193,7 +3526,7 @@ def build_gui():
     country_var = tk.StringVar(value="US")
     input_var = tk.StringVar()
     status_var = tk.StringVar(
-        value="Select a country, then enter a company. KR uses KIS/DART; US uses EDGAR; SG/JP/UK use Yahoo."
+        value="Select a country, then enter a company. KR uses KIS/DART; US uses EDGAR; JP/UK Range Scan use official caches."
     )
     name_var = tk.StringVar(value="-")
     price_var = tk.StringVar(value="-")
@@ -3492,13 +3825,14 @@ def build_gui():
                     last_error = None
 
                     for scan_country in countries:
-                        if scan_country == "JP":
-                            records = load_jp_fundamentals_cache()
+                        if scan_country in ("JP", "UK"):
+                            records = load_jp_fundamentals_cache() if scan_country == "JP" else load_uk_fundamentals_cache()
                             if not records:
-                                set_scan_status("JP cache not found. Run build_jp_cache.bat first.")
+                                cache_name = "JP" if scan_country == "JP" else "UK"
+                                set_scan_status(f"{cache_name} cache not found. Build the fundamentals cache first.")
                                 continue
-                            set_scan_status("JP cache loaded; fetching Yahoo prices...")
-                            records = enrich_jp_cache_records_with_yahoo(records)
+                            set_scan_status(f"{scan_country} cache loaded; fetching Yahoo prices...")
+                            records = enrich_cache_records_with_yahoo(records, scan_country)
                             total = len(records)
                             matched = 0
                             for processed, record in enumerate(records, start=1):
@@ -3526,7 +3860,7 @@ def build_gui():
                                 except Exception as exc:
                                     last_error = str(exc)
                                 if processed % 200 == 0 or processed == total:
-                                    set_scan_status(f"JP cache scanning... {processed}/{total}, matched {matched}")
+                                    set_scan_status(f"{scan_country} cache scanning... {processed}/{total}, matched {matched}")
                             processed_total += total
                             continue
 
@@ -4195,7 +4529,26 @@ if __name__ == "__main__":
     parser.add_argument("--jp-cache-limit", type=int, help="Limit JP cache build to N uncached symbols")
     parser.add_argument("--jp-cache-force", action="store_true", help="Rebuild JP cache from scratch")
     parser.add_argument("--jp-cache-include-price", action="store_true", help="Also fetch J-Quants daily quote during JP cache build")
+    parser.add_argument("--build-uk-cache", action="store_true", help="Build/update UK fundamentals cache from local official ESEF/iXBRL files")
+    parser.add_argument("--uk-cache-output", default=str(UK_FUNDAMENTALS_CACHE_PATH), help="UK cache output JSONL path")
+    parser.add_argument("--uk-cache-input", action="append", help="UK ESEF .zip/.xhtml/.xml file or directory; repeat for multiple companies")
+    parser.add_argument("--uk-cache-ticker", action="append", help="Ticker for each --uk-cache-input, e.g. VOD or VOD.L")
+    parser.add_argument("--uk-cache-name", action="append", help="Company name for each --uk-cache-input")
+    parser.add_argument("--uk-cache-force", action="store_true", help="Rebuild UK cache from scratch")
     args = parser.parse_args()
+
+    if args.build_uk_cache:
+        written, total, last_error = build_uk_fundamentals_cache(
+            Path(args.uk_cache_output),
+            inputs=args.uk_cache_input,
+            tickers=args.uk_cache_ticker,
+            names=args.uk_cache_name,
+            force=args.uk_cache_force,
+        )
+        print(f"UK cache complete: wrote {written}/{total} documents to {args.uk_cache_output}")
+        if last_error:
+            print(f"Last error: {last_error}", file=sys.stderr)
+        sys.exit(0 if written or total == 0 else 1)
 
     if args.build_jp_cache:
         written, total, last_error = build_jp_fundamentals_cache(

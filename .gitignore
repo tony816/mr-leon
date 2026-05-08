@@ -11,4 +11,5 @@ companyfacts/
 submissions/
 
 data/*.jsonl
+data/sg_filings/
 !data/.gitkeep
