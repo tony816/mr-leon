@@ -23,10 +23,20 @@ import xml.etree.ElementTree as ET
 import requests
 from dotenv import load_dotenv
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # Load .env so users can keep keys out of the code.
 load_dotenv(dotenv_path=".env")
 
-ASSUME_ZERO_DEBT_WHEN_MISSING = os.getenv("NET_CASH_ASSUME_ZERO_DEBT", "").lower() in ("1", "true", "yes", "y")
+ASSUME_ZERO_DEBT_WHEN_MISSING = os.getenv("NET_CASH_ASSUME_ZERO_DEBT", "1").lower() in ("1", "true", "yes", "y")
+JP_USE_TOTAL_LIABILITIES_AS_DEBT_FALLBACK = os.getenv(
+    "JP_NET_CASH_USE_TOTAL_LIABILITIES_WHEN_DEBT_MISSING",
+    "1",
+).lower() in ("1", "true", "yes", "y")
 
 KRX_LISTING_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
@@ -86,6 +96,37 @@ class EdgarError(Exception):
 
 class OfficialDataError(Exception):
     """Raised when an official non-US/non-KR data source cannot satisfy a lookup."""
+
+
+def is_dart_usage_limit_error(error: Any) -> bool:
+    text = str(error or "")
+    return "020" in text and "사용한도" in text
+
+
+def describe_dart_error_payload(content: bytes) -> str:
+    text = (content or b"").decode("utf-8", errors="ignore").strip()
+    if not text:
+        return "empty response"
+    try:
+        payload = json.loads(text)
+        status = payload.get("status")
+        message = payload.get("message", "")
+        if status or message:
+            return f"{status} {message}".strip()
+    except Exception:
+        pass
+    status_match = re.search(r"<status>\s*([^<]+)\s*</status>", text)
+    message_match = re.search(r"<message>\s*([^<]+)\s*</message>", text)
+    if status_match or message_match:
+        return " ".join(
+            part
+            for part in (
+                status_match.group(1).strip() if status_match else "",
+                message_match.group(1).strip() if message_match else "",
+            )
+            if part
+        )
+    return text[:300]
 
 
 def normalize_name(text: str) -> str:
@@ -161,7 +202,8 @@ def load_dart_corp_map() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]
                 raise DartError("DART corp code zip is empty.")
             xml_bytes = zf.read(names[0])
     except zipfile.BadZipFile as exc:
-        raise DartError(f"Invalid corp code zip file: {exc}") from exc
+        detail = describe_dart_error_payload(resp.content)
+        raise DartError(f"Failed to load DART corp codes: {detail}") from exc
 
     try:
         root = ET.fromstring(xml_bytes)
@@ -1357,6 +1399,9 @@ def format_yoy_average(values_by_year: Dict[int, Optional[float]], window_years:
 
 def yahoo_symbol_for_ticker(ticker: str) -> str:
     symbol = (ticker or "").strip().upper()
+    yahoo_dot_suffixes = tuple(market["suffix"] for market in GLOBAL_MARKETS.values()) + (".KS", ".KQ")
+    if any(symbol.endswith(suffix) for suffix in yahoo_dot_suffixes):
+        return symbol
     if "." in symbol and "-" not in symbol:
         return symbol.replace(".", "-")
     return symbol
@@ -1403,6 +1448,7 @@ def fetch_yahoo_quotes_batch(tickers: List[str], *, max_retries: int = 3) -> Dic
             "price": entry.get("regularMarketPrice"),
             "per": entry.get("trailingPE"),
             "pbr": entry.get("priceToBook"),
+            "market_cap": entry.get("marketCap"),
             "currency": entry.get("currency"),
             "source": "yahoo",
         }
@@ -1912,10 +1958,14 @@ class JQuantsClient:
 def normalize_jp_code(user_text: str) -> str:
     code = (user_text or "").strip().upper()
     code = code[:-2] if code.endswith(".T") else code
-    digits = "".join(ch for ch in code if ch.isdigit())
-    if len(digits) < 4:
-        raise OfficialDataError("Enter a 4-digit Japanese stock code, e.g. 7203.")
-    return digits[:4]
+    code = re.sub(r"[^0-9A-Z]", "", code)
+    if len(code) >= 5 and code.endswith("0"):
+        code = code[:4]
+    elif len(code) > 4:
+        code = code[:4]
+    if not re.fullmatch(r"[0-9A-Z]{4}", code):
+        raise OfficialDataError("Enter a 4-character Japanese stock code, e.g. 7203 or 130A.")
+    return code
 
 
 def latest_jquants_statement(statements: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1923,7 +1973,18 @@ def latest_jquants_statement(statements: List[Dict[str, Any]]) -> Dict[str, Any]
         raise OfficialDataError("No J-Quants financial statements found.")
     return sorted(
         statements,
-        key=lambda x: str(x.get("DisclosedDate") or x.get("CurrentFiscalYearEndDate") or x.get("DisclosedTime") or ""),
+        key=lambda x: str(
+            jquants_first(
+                x,
+                "DisclosedDate",
+                "DiscDate",
+                "CurrentFiscalYearEndDate",
+                "CurFYEn",
+                "DisclosedTime",
+                "DiscTime",
+                default="",
+            )
+        ),
         reverse=True,
     )[0]
 
@@ -1956,6 +2017,69 @@ def jquants_int(entry: Dict[str, Any], *keys) -> Optional[int]:
     return int(value) if value is not None else None
 
 
+JQUANTS_REVENUE_KEYS = ("NetSales", "OperatingRevenue", "Sales", "NCSales")
+JQUANTS_OP_INCOME_KEYS = ("OperatingProfit", "OperatingIncome", "OP", "NCOP")
+JQUANTS_NET_INCOME_KEYS = ("Profit", "ProfitAttributableToOwnersOfParent", "NetIncome", "NP", "NCNP")
+JQUANTS_EQUITY_KEYS = ("Equity", "NetAssets", "Eq", "NCEq")
+JQUANTS_TOTAL_ASSETS_KEYS = ("Assets", "TotalAssets", "TA", "NCTA")
+JQUANTS_LIABILITIES_KEYS = ("Liabilities", "TotalLiabilities")
+JQUANTS_CASH_KEYS = ("CashAndEquivalents", "CashAndDeposits", "CashEq")
+JQUANTS_DEBT_KEYS = (
+    "InterestBearingDebt",
+    "InterestBearingLiabilities",
+    "Borrowings",
+    "LoansPayable",
+    "ShortTermBorrowings",
+    "LongTermBorrowings",
+    "BondsPayable",
+)
+JQUANTS_SHARES_KEYS = (
+    "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
+    "AverageNumberOfShares",
+    "IssuedShare",
+    "ShOutFY",
+    "AvgSh",
+)
+JQUANTS_EPS_KEYS = ("EarningsPerShare", "EPS", "NCEPS")
+JQUANTS_BPS_KEYS = ("BookValuePerShare", "BPS", "NCBPS")
+
+
+def jquants_statement_year(entry: Dict[str, Any]) -> Optional[int]:
+    value = jquants_first(
+        entry,
+        "CurrentFiscalYearEndDate",
+        "CurFYEn",
+        "DisclosedDate",
+        "DiscDate",
+        "DisclosedTime",
+        "DiscTime",
+    )
+    year = _coerce_year(value)
+    if year is not None:
+        return year
+    match = re.match(r"\s*(\d{4})", str(value or ""))
+    return int(match.group(1)) if match else None
+
+
+def jquants_liabilities(entry: Dict[str, Any], equity: Optional[int] = None) -> Optional[int]:
+    liabilities = jquants_int(entry, *JQUANTS_LIABILITIES_KEYS)
+    if liabilities is not None:
+        return liabilities
+    assets = jquants_int(entry, *JQUANTS_TOTAL_ASSETS_KEYS)
+    if assets is not None and equity is not None:
+        return assets - equity
+    return None
+
+
+def jquants_debt(entry: Dict[str, Any], liabilities: Optional[int] = None) -> Tuple[Optional[int], str]:
+    debt = jquants_int(entry, *JQUANTS_DEBT_KEYS)
+    if debt is not None:
+        return debt, "interest_bearing_debt"
+    if JP_USE_TOTAL_LIABILITIES_AS_DEBT_FALLBACK and liabilities is not None:
+        return liabilities, "total_liabilities_fallback"
+    return None, "missing"
+
+
 def fetch_jquants_financials(user_text: str) -> Tuple[PriceSnapshot, Dict[str, Any]]:
     return fetch_jquants_financials_with_client(user_text, JQuantsClient(), include_price=True)
 
@@ -1970,24 +2094,19 @@ def fetch_jquants_financials_with_client(
     statement = latest_jquants_statement(statements)
     quote = latest_jquants_quote(client.get_daily_quotes(code)) if include_price else {}
 
-    name = jquants_first(info, "CompanyNameEnglish", "CompanyName", "Name", default=code)
+    name = jquants_first(info, "CompanyNameEnglish", "CoNameEn", "CompanyName", "CoName", "Name", default=code)
     price_val = jquants_value(quote, "AdjustmentClose", "AdjC", "Close", "C")
-    revenue = jquants_int(statement, "NetSales", "OperatingRevenue", "Sales")
-    op_income = jquants_int(statement, "OperatingProfit", "OperatingIncome")
-    net_income = jquants_int(statement, "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome")
-    equity = jquants_int(statement, "Equity", "NetAssets")
-    liabilities = jquants_int(statement, "Liabilities")
-    cash_val = jquants_int(statement, "CashAndEquivalents", "CashAndDeposits")
-    debt_val = jquants_int(statement, "InterestBearingDebt")
-    shares = jquants_int(
-        statement,
-        "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock",
-        "AverageNumberOfShares",
-        "IssuedShare",
-    )
+    revenue = jquants_int(statement, *JQUANTS_REVENUE_KEYS)
+    op_income = jquants_int(statement, *JQUANTS_OP_INCOME_KEYS)
+    net_income = jquants_int(statement, *JQUANTS_NET_INCOME_KEYS)
+    equity = jquants_int(statement, *JQUANTS_EQUITY_KEYS)
+    liabilities = jquants_liabilities(statement, equity)
+    cash_val = jquants_int(statement, *JQUANTS_CASH_KEYS)
+    debt_val, debt_source = jquants_debt(statement, liabilities)
+    shares = jquants_int(statement, *JQUANTS_SHARES_KEYS)
 
-    eps = jquants_value(statement, "EarningsPerShare")
-    bps = jquants_value(statement, "BookValuePerShare")
+    eps = jquants_value(statement, *JQUANTS_EPS_KEYS)
+    bps = jquants_value(statement, *JQUANTS_BPS_KEYS)
     per_val = price_val / eps if price_val is not None and eps not in (None, 0) else None
     pbr_val = price_val / bps if price_val is not None and bps not in (None, 0) else None
     net_cash, debt_used = compute_net_cash(
@@ -2002,12 +2121,12 @@ def fetch_jquants_financials_with_client(
     op_series = {}
     net_series = {}
     for item in statements:
-        year = _coerce_year(item.get("CurrentFiscalYearEndDate") or item.get("DisclosedDate") or item.get("DisclosedTime"))
+        year = jquants_statement_year(item)
         if not year:
             continue
-        statement_series[year] = jquants_value(item, "NetSales", "OperatingRevenue", "Sales")
-        op_series[year] = jquants_value(item, "OperatingProfit", "OperatingIncome")
-        net_series[year] = jquants_value(item, "Profit", "ProfitAttributableToOwnersOfParent", "NetIncome")
+        statement_series[year] = jquants_value(item, *JQUANTS_REVENUE_KEYS)
+        op_series[year] = jquants_value(item, *JQUANTS_OP_INCOME_KEYS)
+        net_series[year] = jquants_value(item, *JQUANTS_NET_INCOME_KEYS)
     sales_avg, sales_count, sales_transitions = compute_yoy_average_stats(statement_series, window_years=5)
     op_avg, op_count, op_transitions = compute_yoy_average_stats(op_series, window_years=5)
     net_avg, net_count, net_transitions = compute_yoy_average_stats(net_series, window_years=5)
@@ -2030,10 +2149,12 @@ def fetch_jquants_financials_with_client(
         "corp_name": str(name),
         "corp_code": code,
         "bsns_year": str(
-            _coerce_year(statement.get("CurrentFiscalYearEndDate") or statement.get("DisclosedDate") or statement.get("DisclosedTime"))
-            or "-"
+            jquants_statement_year(statement) or "-"
         ),
         "summary": {
+            "sales": format_amount(revenue) if revenue is not None else "N/A",
+            "op_income": format_amount(op_income) if op_income is not None else "N/A",
+            "equity": format_amount(equity) if equity is not None else "N/A",
             "매출액": format_amount(revenue) if revenue is not None else "N/A",
             "영업이익": format_amount(op_income) if op_income is not None else "N/A",
             "자본총계": format_amount(equity) if equity is not None else "N/A",
@@ -2049,10 +2170,12 @@ def fetch_jquants_financials_with_client(
         "net_income_growth_5y_avg_pct": net_avg,
         "liquid_funds_total": cash_val,
         "interest_bearing_debt": debt_used,
+        "interest_bearing_debt_source": debt_source,
         "net_cash": net_cash,
         "net_cash_per_share_value": net_cash_ps,
         "net_cash_display": format_amount(net_cash) if net_cash is not None else "N/A",
         "float_shares": shares,
+        "shares": shares,
         "float_shares_display": format_amount(shares) if shares is not None else None,
         "net_cash_per_share": format_per_share(net_cash, shares),
         "net_cash_per_share_ratio": net_cash_ratio_text,
@@ -2275,7 +2398,7 @@ def load_scan_targets(country: str, status_cb: Optional[Callable[[str], None]] =
             targets = []
             for row in rows:
                 code = str(row.get("Code") or row.get("LocalCode") or "").strip()[:4]
-                name = str(jquants_first(row, "CompanyNameEnglish", "CompanyName", "Name", default=code))
+                name = str(jquants_first(row, "CompanyNameEnglish", "CoNameEn", "CompanyName", "CoName", "Name", default=code))
                 if code:
                     targets.append({"country": "JP", "ticker": code, "name": name or code})
             return targets
@@ -2337,7 +2460,7 @@ def yahoo_fast_scan_detail(
 
 def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[str, Any]) -> Dict[str, Any]:
     summary = detail.get("summary", {}) if isinstance(detail, dict) else {}
-    return {
+    record = {
         "country": country,
         "code": snapshot.code,
         "name": snapshot.name,
@@ -2365,6 +2488,14 @@ def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[s
         "bsns_year": detail.get("bsns_year", "-"),
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
+    record["sales"] = summary.get("sales") or record.get("sales", "N/A")
+    record["op_income"] = summary.get("op_income") or record.get("op_income", "N/A")
+    record["equity"] = summary.get("equity") or record.get("equity", "N/A")
+    record["liquid_funds"] = detail.get("liquid_funds_total")
+    record["interest_bearing_debt"] = detail.get("interest_bearing_debt")
+    record["interest_bearing_debt_source"] = detail.get("interest_bearing_debt_source")
+    record["shares"] = detail.get("shares") or detail.get("float_shares")
+    return record
 
 
 def format_cache_delta(record: Dict[str, Any], growth_key: str) -> str:
@@ -2633,6 +2764,13 @@ def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str
             record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price)) * 100:,.2f}%"
         except Exception:
             pass
+    elif market_cap not in (None, 0):
+        net_cash = parse_float(record.get("net_cash"))
+        if net_cash is not None:
+            try:
+                record["net_cash_per_share_ratio"] = f"{(net_cash / float(market_cap)) * 100:,.2f}%"
+            except Exception:
+                pass
     if quote and quote.get("source"):
         record["quote_source"] = quote.get("source")
 
@@ -2853,7 +2991,7 @@ UK_REVENUE_TAGS = ("Revenue", "RevenueFromContractsWithCustomers", "RevenueFromC
 UK_OP_INCOME_TAGS = ("OperatingProfitLoss", "ProfitLossFromOperatingActivities", "OperatingProfit")
 UK_NET_INCOME_TAGS = ("ProfitLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLossFromContinuingOperations")
 UK_CASH_TAGS = ("CashAndCashEquivalents", "CashAndCashEquivalentsAtCarryingValue")
-UK_EQUITY_TAGS = ("Equity", "EquityAttributableToOwnersOfParent", "TotalEquity")
+UK_EQUITY_TAGS = ("EquityAttributableToOwnersOfParent", "TotalEquity", "Equity")
 UK_LIABILITIES_TAGS = ("Liabilities", "TotalLiabilities")
 UK_DEBT_TAGS = (
     "Borrowings",
@@ -2862,6 +3000,16 @@ UK_DEBT_TAGS = (
     "LoansAndBorrowings",
     "CurrentLoansAndBorrowings",
     "NoncurrentLoansAndBorrowings",
+    "InterestBearingLoansAndBorrowings",
+    "CurrentInterestBearingLoansAndBorrowings",
+    "NoncurrentInterestBearingLoansAndBorrowings",
+    "FinancialLiabilitiesAtAmortisedCost",
+    "CurrentFinancialLiabilities",
+    "NoncurrentFinancialLiabilities",
+    "DebtSecurities",
+    "DebtSecuritiesInIssue",
+    "CurrentDebtSecuritiesInIssue",
+    "NoncurrentDebtSecuritiesInIssue",
     "LeaseLiabilities",
     "CurrentLeaseLiabilities",
     "NoncurrentLeaseLiabilities",
@@ -2920,6 +3068,9 @@ def uk_facts_to_cache_record(code: str, name: str, source: str, parsed: Dict[str
         "net_income_growth_5y_avg_pct": net_avg,
         "liabilities_ratio_value": liabilities_ratio,
         "interest_bearing_debt_ratio_value": debt_ratio,
+        "liquid_funds_total": int(cash_val) if cash_val is not None else None,
+        "liquid_funds": int(cash_val) if cash_val is not None else None,
+        "interest_bearing_debt": debt_used,
         "net_cash": net_cash,
         "quote_source": "yahoo",
         "fundamentals_source": "official-esef",
@@ -2996,14 +3147,21 @@ def build_jp_fundamentals_cache(
     client = JQuantsClient()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cached_codes = set() if force else load_cached_codes(output_path)
+    print("JP cache: loading J-Quants listed info...", flush=True)
     rows = client.get_listed_info()
+    print(f"JP cache: loaded {len(rows)} listed rows; preparing targets...", flush=True)
     targets = []
     for row in rows:
-        code = str(row.get("Code") or row.get("LocalCode") or "").strip()[:4]
+        raw_code = str(row.get("Code") or row.get("LocalCode") or "").strip()
+        try:
+            code = normalize_jp_code(raw_code)
+        except OfficialDataError:
+            continue
         if code and (force or code not in cached_codes):
             targets.append(code)
     if limit is not None and limit > 0:
         targets = targets[:limit]
+    print(f"JP cache: {len(targets)} uncached targets to process", flush=True)
 
     mode = "w" if force else "a"
     written = 0
@@ -3018,7 +3176,10 @@ def build_jp_fundamentals_cache(
                 print(f"[{idx}/{len(targets)}] cached JP {code} {snapshot.name}")
             except Exception as exc:
                 last_error = str(exc)
-                print(f"[{idx}/{len(targets)}] failed JP {code}: {exc}", file=sys.stderr)
+                if "No J-Quants financial statements found" in last_error:
+                    print(f"[{idx}/{len(targets)}] skipped JP {code}: {exc}")
+                else:
+                    print(f"[{idx}/{len(targets)}] failed JP {code}: {exc}", file=sys.stderr)
     return written, len(targets), last_error
 
 
@@ -3497,8 +3658,18 @@ def build_kr_fundamentals_cache(
 ) -> Tuple[int, int, Optional[str]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cached_codes = set() if force else load_cached_codes(output_path)
-    _, stock_map, code_to_name = load_dart_corp_map()
-    krx_codes = set(load_name_map().values())
+    try:
+        _, stock_map, code_to_name = load_dart_corp_map()
+        krx_codes = set(load_name_map().values())
+    except Exception as exc:
+        last_error = str(exc)
+        if is_dart_usage_limit_error(exc):
+            print(
+                "OpenDART daily usage limit reached before loading the company map. Rerun `python app.py --build-kr-cache` later to resume.",
+                file=sys.stderr,
+            )
+            return 0, 0, last_error
+        raise
     targets = [
         (stock_code, corp_code)
         for stock_code, corp_code in sorted(stock_map.items())
@@ -3521,6 +3692,12 @@ def build_kr_fundamentals_cache(
             except Exception as exc:
                 last_error = str(exc)
                 print(f"[{idx}/{len(targets)}] failed KR {stock_code}: {exc}", file=sys.stderr)
+                if is_dart_usage_limit_error(exc):
+                    print(
+                        "OpenDART daily usage limit reached. Stop now and rerun `python app.py --build-kr-cache` later to resume.",
+                        file=sys.stderr,
+                    )
+                    break
     return written, len(targets), last_error
 
 
@@ -4253,7 +4430,7 @@ def build_gui():
                     last_error = None
 
                     for scan_country in countries:
-                        if scan_country in ("US", "JP", "UK"):
+                        if scan_country in ("US", "KR", "JP", "UK"):
                             set_scan_status(fundamentals_cache_status(scan_country))
                             records = load_country_fundamentals_cache(scan_country)
                             if not records:

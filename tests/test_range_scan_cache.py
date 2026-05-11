@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app
+import build_uk_cache_db
 
 
 def sec_fact(value, *, unit="USD", year=2024):
@@ -101,6 +102,102 @@ class RangeScanCacheTests(unittest.TestCase):
             self.assertEqual(payload["corp_code"], "12345678")
             self.assertEqual(payload["net_cash_per_share_value"], 30.0)
 
+    def test_kr_cache_builder_stops_on_dart_usage_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "kr_cache.jsonl"
+            stock_map = {"000001": "12345678", "000002": "87654321"}
+            names = {"12345678": "One", "87654321": "Two"}
+            with patch.object(app, "load_dart_corp_map", return_value=({}, stock_map, names)):
+                with patch.object(app, "load_name_map", return_value={"one": "000001", "two": "000002"}):
+                    with patch.object(app, "fetch_dart_financials", side_effect=app.DartError("020 사용한도를 초과하였습니다.")) as fetch_mock:
+                        with patch("builtins.print"):
+                            written, total, last_error = app.build_kr_fundamentals_cache(output_path, force=True)
+
+            self.assertEqual(written, 0)
+            self.assertEqual(total, 2)
+            self.assertIn("020", last_error)
+            self.assertEqual(fetch_mock.call_count, 1)
+
+    def test_kr_cache_builder_stops_when_corp_map_hits_usage_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "kr_cache.jsonl"
+            with patch.object(app, "load_dart_corp_map", side_effect=app.DartError("020 사용한도를 초과하였습니다.")):
+                with patch("builtins.print") as print_mock:
+                    written, total, last_error = app.build_kr_fundamentals_cache(output_path, force=True)
+
+        self.assertEqual((written, total), (0, 0))
+        self.assertIn("020", last_error)
+        self.assertTrue(print_mock.called)
+
+    def test_jquants_v2_abbreviated_fields_populate_cache_metrics(self):
+        class FakeJQuantsClient:
+            def get_listed_info(self, code=None):
+                return [{"Code": "7203", "CompanyNameEnglish": "TOYOTA MOTOR"}]
+
+            def get_statements(self, code):
+                return [
+                    {
+                        "Code": "7203",
+                        "DiscDate": "2025-05-01",
+                        "CurFYEn": "2025-03-31",
+                        "Sales": "1000",
+                        "OP": "120",
+                        "NP": "80",
+                        "Eq": "600",
+                        "TA": "1000",
+                        "CashEq": "700",
+                        "ShOutFY": "10",
+                        "EPS": "8",
+                        "BPS": "60",
+                    }
+                ]
+
+        snapshot, detail = app.fetch_jquants_financials_with_client("7203", FakeJQuantsClient(), include_price=False)
+        record = app.detail_to_cache_record("JP", snapshot, detail)
+
+        self.assertEqual(record["sales"], "1,000")
+        self.assertEqual(record["op_income"], "120")
+        self.assertEqual(record["equity"], "600")
+        self.assertEqual(record["liabilities_ratio_value"], 400 / 600 * 100)
+        self.assertEqual(record["interest_bearing_debt_source"], "total_liabilities_fallback")
+        self.assertEqual(record["net_cash"], 300)
+        self.assertEqual(record["net_cash_per_share_value"], 30)
+        self.assertEqual(record["shares"], 10)
+        self.assertEqual(record["bsns_year"], "2025")
+
+    def test_jquants_missing_debt_defaults_to_zero_for_net_cash(self):
+        class FakeJQuantsClient:
+            def get_listed_info(self, code=None):
+                return [{"Code": "1111", "CompanyNameEnglish": "CASH CO"}]
+
+            def get_statements(self, code):
+                return [
+                    {
+                        "Code": "1111",
+                        "DiscDate": "2025-05-01",
+                        "Sales": "1000",
+                        "OP": "120",
+                        "NP": "80",
+                        "Eq": "600",
+                        "CashEq": "700",
+                        "ShOutFY": "10",
+                    }
+                ]
+
+        snapshot, detail = app.fetch_jquants_financials_with_client("1111", FakeJQuantsClient(), include_price=False)
+        record = app.detail_to_cache_record("JP", snapshot, detail)
+
+        self.assertEqual(record["liquid_funds"], 700)
+        self.assertEqual(record["interest_bearing_debt"], 0)
+        self.assertEqual(record["net_cash"], 700)
+        self.assertEqual(record["net_cash_per_share_value"], 70)
+
+    def test_normalize_jp_code_accepts_alphanumeric_tse_codes(self):
+        self.assertEqual(app.normalize_jp_code("72030"), "7203")
+        self.assertEqual(app.normalize_jp_code("7203.T"), "7203")
+        self.assertEqual(app.normalize_jp_code("130A0"), "130A")
+        self.assertEqual(app.normalize_jp_code("130A.T"), "130A")
+
     def test_yahoo_missing_ratios_fall_back_to_cache_fundamentals(self):
         records = [
             {
@@ -123,6 +220,82 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(app.parse_float(enriched[0]["per"]), 20.0)
         self.assertEqual(app.parse_float(enriched[0]["pbr"]), 5.0)
         self.assertEqual(enriched[0]["net_cash_per_share_ratio"], "50.00%")
+
+    def test_yahoo_symbol_preserves_international_exchange_suffixes(self):
+        self.assertEqual(app.yahoo_symbol_for_ticker("BP.L"), "BP.L")
+        self.assertEqual(app.yahoo_symbol_for_ticker("7203.T"), "7203.T")
+        self.assertEqual(app.yahoo_symbol_for_ticker("005930.KS"), "005930.KS")
+        self.assertEqual(app.yahoo_symbol_for_ticker("005930.KQ"), "005930.KQ")
+        self.assertEqual(app.yahoo_symbol_for_ticker("BRK.B"), "BRK-B")
+
+    def test_cached_scan_uses_country_quote_symbols_and_cache_fallbacks(self):
+        cases = [
+            ("KR", "005930", ["005930.KS", "005930.KQ"], "005930.KS"),
+            ("JP", "7203", ["7203.T"], "7203.T"),
+            ("UK", "BP", ["BP.L"], "BP.L"),
+        ]
+        for country, code, expected_symbols, quote_symbol in cases:
+            with self.subTest(country=country):
+                records = [
+                    {
+                        "country": country,
+                        "code": code,
+                        "shares": 100,
+                        "net_income": 50,
+                        "equity": 200,
+                        "net_cash_per_share_value": 5,
+                    }
+                ]
+                calls = []
+
+                def quote_fetcher(symbols):
+                    calls.append(list(symbols))
+                    return {
+                        quote_symbol: {
+                            "symbol": quote_symbol,
+                            "price": 10,
+                            "per": None,
+                            "pbr": None,
+                            "source": "yahoo",
+                        }
+                    }
+
+                enriched = app.enrich_cache_records_with_yahoo(records, country, quote_fetcher=quote_fetcher)
+
+                self.assertEqual(calls, [expected_symbols])
+                self.assertEqual(app.parse_float(enriched[0]["per"]), 20.0)
+                self.assertEqual(app.parse_float(enriched[0]["pbr"]), 5.0)
+                self.assertEqual(enriched[0]["net_cash_per_share_ratio"], "50.00%")
+
+    def test_net_cash_ratio_falls_back_to_market_cap_when_shares_missing(self):
+        record = {
+            "country": "UK",
+            "code": "ABC",
+            "net_cash": 25,
+            "net_cash_per_share_value": None,
+        }
+
+        app.apply_quote_to_cache_record(
+            record,
+            {"symbol": "ABC.L", "price": 100, "market_cap": 200, "source": "yahoo"},
+        )
+
+        self.assertEqual(record["net_cash_per_share_ratio"], "12.50%")
+
+    def test_uk_cache_builder_missing_debt_defaults_to_zero_for_net_cash(self):
+        facts = {
+            "CashAndCashEquivalents": [{"value": 500.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "Equity": [{"value": 1000.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "Liabilities": [{"value": 200.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "NumberOfSharesOutstanding": [{"value": 10.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+        }
+
+        record = build_uk_cache_db.build_cache_record("ABC", "ABC PLC", facts, ["mock.xhtml"], 5)
+
+        self.assertEqual(record["liquid_funds_total"], 500.0)
+        self.assertEqual(record["interest_bearing_debt"], 0.0)
+        self.assertEqual(record["net_cash"], 500.0)
+        self.assertEqual(record["net_cash_per_share_value"], 50.0)
 
     def test_cached_scan_batches_quotes_without_official_detail_calls(self):
         records = [
