@@ -192,6 +192,48 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(record["net_cash"], 700)
         self.assertEqual(record["net_cash_per_share_value"], 70)
 
+    def test_jquants_uses_latest_statement_with_cash_for_net_cash(self):
+        class FakeJQuantsClient:
+            def get_listed_info(self, code=None):
+                return [{"Code": "1301", "CompanyNameEnglish": "KYOKUYO"}]
+
+            def get_statements(self, code):
+                return [
+                    {
+                        "Code": "1301",
+                        "DiscDate": "2026-02-06",
+                        "CurFYEn": "2026-03-31",
+                        "Sales": "256910",
+                        "OP": "9064",
+                        "NP": "5682",
+                        "Eq": "75639",
+                        "TA": "222439",
+                        "CashEq": "",
+                        "ShOutFY": "10",
+                    },
+                    {
+                        "Code": "1301",
+                        "DiscDate": "2025-11-04",
+                        "CurFYEn": "2026-03-31",
+                        "Sales": "155996",
+                        "OP": "4555",
+                        "NP": "2814",
+                        "Eq": "71992",
+                        "TA": "200027",
+                        "CashEq": "8071",
+                        "ShOutFY": "10",
+                    },
+                ]
+
+        snapshot, detail = app.fetch_jquants_financials_with_client("1301", FakeJQuantsClient(), include_price=False)
+        record = app.detail_to_cache_record("JP", snapshot, detail)
+
+        self.assertEqual(record["sales"], "256,910")
+        self.assertEqual(record["equity"], "71,992")
+        self.assertEqual(record["liquid_funds"], 8071)
+        self.assertEqual(record["net_cash"], 8071 - (200027 - 71992))
+        self.assertEqual(record["liquid_funds_source_date"], "2025-11-04")
+
     def test_normalize_jp_code_accepts_alphanumeric_tse_codes(self):
         self.assertEqual(app.normalize_jp_code("72030"), "7203")
         self.assertEqual(app.normalize_jp_code("7203.T"), "7203")

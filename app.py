@@ -1989,6 +1989,29 @@ def latest_jquants_statement(statements: List[Dict[str, Any]]) -> Dict[str, Any]
     )[0]
 
 
+def latest_jquants_statement_with_value(statements: List[Dict[str, Any]], *keys: str) -> Optional[Dict[str, Any]]:
+    ordered = sorted(
+        statements or [],
+        key=lambda x: str(
+            jquants_first(
+                x,
+                "DisclosedDate",
+                "DiscDate",
+                "CurrentFiscalYearEndDate",
+                "CurFYEn",
+                "DisclosedTime",
+                "DiscTime",
+                default="",
+            )
+        ),
+        reverse=True,
+    )
+    for item in ordered:
+        if jquants_int(item, *keys) is not None:
+            return item
+    return None
+
+
 def latest_jquants_quote(quotes: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not quotes:
         return {}
@@ -2092,6 +2115,7 @@ def fetch_jquants_financials_with_client(
     info = info_list[0] if info_list else {}
     statements = client.get_statements(code)
     statement = latest_jquants_statement(statements)
+    balance_statement = latest_jquants_statement_with_value(statements, *JQUANTS_CASH_KEYS) or statement
     quote = latest_jquants_quote(client.get_daily_quotes(code)) if include_price else {}
 
     name = jquants_first(info, "CompanyNameEnglish", "CoNameEn", "CompanyName", "CoName", "Name", default=code)
@@ -2099,11 +2123,11 @@ def fetch_jquants_financials_with_client(
     revenue = jquants_int(statement, *JQUANTS_REVENUE_KEYS)
     op_income = jquants_int(statement, *JQUANTS_OP_INCOME_KEYS)
     net_income = jquants_int(statement, *JQUANTS_NET_INCOME_KEYS)
-    equity = jquants_int(statement, *JQUANTS_EQUITY_KEYS)
-    liabilities = jquants_liabilities(statement, equity)
-    cash_val = jquants_int(statement, *JQUANTS_CASH_KEYS)
-    debt_val, debt_source = jquants_debt(statement, liabilities)
-    shares = jquants_int(statement, *JQUANTS_SHARES_KEYS)
+    equity = jquants_int(balance_statement, *JQUANTS_EQUITY_KEYS)
+    liabilities = jquants_liabilities(balance_statement, equity)
+    cash_val = jquants_int(balance_statement, *JQUANTS_CASH_KEYS)
+    debt_val, debt_source = jquants_debt(balance_statement, liabilities)
+    shares = jquants_int(statement, *JQUANTS_SHARES_KEYS) or jquants_int(balance_statement, *JQUANTS_SHARES_KEYS)
 
     eps = jquants_value(statement, *JQUANTS_EPS_KEYS)
     bps = jquants_value(statement, *JQUANTS_BPS_KEYS)
@@ -2171,6 +2195,14 @@ def fetch_jquants_financials_with_client(
         "liquid_funds_total": cash_val,
         "interest_bearing_debt": debt_used,
         "interest_bearing_debt_source": debt_source,
+        "liquid_funds_source_date": jquants_first(
+            balance_statement,
+            "DisclosedDate",
+            "DiscDate",
+            "CurrentFiscalYearEndDate",
+            "CurFYEn",
+            default="-",
+        ),
         "net_cash": net_cash,
         "net_cash_per_share_value": net_cash_ps,
         "net_cash_display": format_amount(net_cash) if net_cash is not None else "N/A",
@@ -2492,6 +2524,7 @@ def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[s
     record["op_income"] = summary.get("op_income") or record.get("op_income", "N/A")
     record["equity"] = summary.get("equity") or record.get("equity", "N/A")
     record["liquid_funds"] = detail.get("liquid_funds_total")
+    record["liquid_funds_source_date"] = detail.get("liquid_funds_source_date")
     record["interest_bearing_debt"] = detail.get("interest_bearing_debt")
     record["interest_bearing_debt_source"] = detail.get("interest_bearing_debt_source")
     record["shares"] = detail.get("shares") or detail.get("float_shares")
