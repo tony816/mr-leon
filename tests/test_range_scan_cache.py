@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import app
 import build_uk_cache_db
+import collect_uk_ch_and_build_cache
 
 
 def sec_fact(value, *, unit="USD", year=2024):
@@ -338,6 +339,104 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(record["interest_bearing_debt"], 0.0)
         self.assertEqual(record["net_cash"], 500.0)
         self.assertEqual(record["net_cash_per_share_value"], 50.0)
+
+    def test_uk_universe_placeholder_marks_missing_fundamentals(self):
+        record = build_uk_cache_db.universe_placeholder_record(
+            {
+                "ticker": "ABC",
+                "name": "ABC PLC",
+                "isin": "GB00ABC",
+                "lei": "ABCLEI",
+                "market": "MAIN MARKET",
+                "instrument_type": "Equity shares",
+            }
+        )
+
+        self.assertEqual(record["code"], "ABC")
+        self.assertEqual(record["fundamentals_status"], "missing_official_fundamentals")
+        self.assertEqual(record["isin"], "GB00ABC")
+        self.assertFalse(record["coverage"]["cash"])
+
+    def test_cached_scan_excludes_missing_fundamentals_placeholders(self):
+        self.assertFalse(
+            app.cache_record_passes_filters(
+                {
+                    "fundamentals_status": "missing_official_fundamentals",
+                    "per": 10,
+                    "pbr": 1,
+                },
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        )
+
+    def test_lse_full_universe_matches_nsm_report_by_lei(self):
+        reports = [
+            {
+                "company": "ABC PUBLIC LIMITED COMPANY",
+                "lei": "ABCLEI",
+                "download_link": "/download/abc.zip",
+            }
+        ]
+        row = collect_uk_ch_and_build_cache.LseRow(
+            ticker="ABC",
+            name="ABC PLC",
+            isin="GB00ABC",
+            lei="ABCLEI",
+            market="MAIN MARKET",
+            instrument_type="Equity shares",
+            source="lse",
+            raw={},
+        )
+
+        indexes = collect_uk_ch_and_build_cache.build_nsm_match_indexes(reports)
+        match = collect_uk_ch_and_build_cache.match_nsm_report_for_lse_row_indexed(row, indexes)
+
+        self.assertIs(match, reports[0])
+
+    def test_lse_full_universe_missing_rows_feed_ch_backfill(self):
+        reports = [
+            {
+                "company": "MATCHED PUBLIC LIMITED COMPANY",
+                "lei": "MATCHLEI",
+                "download_link": "/download/matched.zip",
+            }
+        ]
+        matched = collect_uk_ch_and_build_cache.LseRow(
+            ticker="MAT",
+            name="Matched PLC",
+            isin="GB00MAT",
+            lei="MATCHLEI",
+            market="MAIN MARKET",
+            instrument_type="Equity shares",
+            source="lse",
+            raw={},
+        )
+        missing = collect_uk_ch_and_build_cache.LseRow(
+            ticker="MIS",
+            name="Missing PLC",
+            isin="GB00MIS",
+            lei="MISSLEI",
+            market="MAIN MARKET",
+            instrument_type="Equity shares",
+            source="lse",
+            raw={},
+        )
+
+        rows = collect_uk_ch_and_build_cache.lse_rows_missing_nsm_esef([matched, missing], reports)
+
+        self.assertEqual(rows, [missing])
 
     def test_cached_scan_batches_quotes_without_official_detail_calls(self):
         records = [

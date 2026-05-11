@@ -89,6 +89,7 @@ CH_SEARCH_ENDPOINT = "https://api.company-information.service.gov.uk/search/comp
 FCA_NSM_SEARCH_API = "https://api.data.fca.org.uk/search"
 FCA_ARTEFACT_BASE = "https://data.fca.org.uk/artefacts/"
 LSE_AUTOCOMPLETE_URL = "https://api.londonstockexchange.com/api/gw/lse/search/autocomplete"
+LSE_API_BASE = "https://api.londonstockexchange.com"
 
 USER_AGENT = "mr-leon-uk-cache-builder/2.0 (+official LSE/Companies House collector)"
 DEFAULT_WORK_DIR = Path(r"C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache")
@@ -466,9 +467,70 @@ def discover_lse_report_url(kind: str, timeout: int) -> str:
         if score > 0:
             scored.append((score, url, label))
     if not scored:
+        api_url = discover_lse_report_url_from_api(kind, timeout)
+        if api_url:
+            return api_url
         raise RuntimeError("Could not discover LSE report download URL. Pass --lse-report-file or --lse-report-url.")
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
+
+
+def lse_api_json(method: str, path: str, timeout: int, payload: Optional[Dict[str, Any]] = None) -> Any:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        urllib.parse.urljoin(LSE_API_BASE, path),
+        data=data,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Origin": "https://www.londonstockexchange.com",
+            "Referer": "https://www.londonstockexchange.com/reports",
+        },
+        method=method.upper(),
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def discover_lse_report_url_from_api(kind: str, timeout: int) -> str:
+    page = lse_api_json("GET", "/api/v1/pages?path=reports&parameters=", timeout)
+    target_label = "Instruments" if kind.startswith("instrument") else "Issuers"
+    target = None
+    for component in page.get("components") or []:
+        for content in component.get("content") or []:
+            value = content.get("value") or {}
+            for group in value.get("reportsFilterToggleFilters") or []:
+                for sub in group.get("subFilters") or []:
+                    if str(sub.get("label") or "").strip().lower() == target_label.lower():
+                        modules = sub.get("modules") or []
+                        if modules:
+                            target = {
+                                "tab_id": sub.get("tabId"),
+                                "module_id": modules[0].get("moduleId"),
+                            }
+                            break
+                if target:
+                    break
+        if target:
+            break
+    if not target:
+        return ""
+    payload = {
+        "path": "reports",
+        "parameters": urllib.parse.urlencode({"tab": target_label.lower(), "tabId": target["tab_id"]}),
+        "components": [{"componentId": target["module_id"], "parameters": None}],
+    }
+    refreshed = lse_api_json("POST", "/api/v1/components/refresh", timeout, payload=payload)
+    for component in refreshed or []:
+        for content in component.get("content") or []:
+            value = content.get("value") or {}
+            for item in value.get("ctaItems") or []:
+                title = str(item.get("ctaTitle") or "").lower()
+                button = item.get("ctaButton") or {}
+                link = str(button.get("link") or "")
+                if link and target_label.lower().rstrip("s") in title:
+                    return link
+    return ""
 
 
 def download_lse_report(args: argparse.Namespace) -> Path:
@@ -645,8 +707,14 @@ def row_to_lse_row(row: Dict[str, str], source: str) -> LseRow:
         name = any_value_by_contains(row, ["issuer", "company", "instrumentname", "securityname"])
     isin = first_value(row, ["isin", "isin code", "instrument isin"])
     lei = first_value(row, ["lei", "issuer lei", "legal entity identifier"])
-    market = first_value(row, ["market", "market name", "segment", "trading service", "exchange market size", "admission market"])
-    instrument_type = first_value(row, ["instrument type", "security type", "type", "asset class", "category", "classification"])
+    market = first_value(row, [
+        "market", "market name", "lse market", "segment", "trading service", "exchange market size",
+        "admission market", "market segment code", "market sector code", "fca listing category",
+    ])
+    instrument_type = first_value(row, [
+        "instrument type", "security type", "type", "asset class", "category", "classification",
+        "mifir identifier name", "mifir identifier code", "instrument name",
+    ])
     return LseRow(
         ticker=normalize_ticker(ticker),
         name=name.strip(),
@@ -852,6 +920,98 @@ def build_universe_from_lse(args: argparse.Namespace) -> UniverseBuildResult:
     return UniverseBuildResult(accepted=accepted, review_rows=review_rows, raw_rows=rows)
 
 
+def map_lse_rows_to_companies_house(
+    args: argparse.Namespace,
+    rows: Sequence[LseRow],
+    *,
+    accepted_output: Optional[Path] = None,
+    review_output: Optional[Path] = None,
+) -> UniverseBuildResult:
+    api_key = args.ch_api_key or os.getenv(args.ch_api_key_env or "COMPANIES_HOUSE_API_KEY", "")
+    if not api_key:
+        raise SystemExit(
+            "Companies House backfill requires a Companies House API key. "
+            "Set COMPANIES_HOUSE_API_KEY or pass --ch-api-key."
+        )
+
+    accepted: List[Company] = []
+    review_rows: List[Dict[str, Any]] = []
+    seen_company_numbers = set()
+    seen_lse_keys = set()
+    limit = args.max_ch_backfill_rows or len(rows)
+    total = min(limit, len(rows))
+    log(f"CH backfill mapping missing LSE rows to company_number: {total} rows")
+
+    for idx, item in enumerate(rows[:limit], 1):
+        if idx % 50 == 0:
+            log(f"  CH backfill mapped {idx}/{total}...")
+        lse_key = (compact_name(item.name), item.isin or item.ticker)
+        if lse_key in seen_lse_keys:
+            continue
+        seen_lse_keys.add(lse_key)
+
+        candidates: List[ChCandidate] = []
+        last_error = ""
+        for query in query_variants_for_lse_name(item.name):
+            try:
+                candidates = search_companies_house(api_key, query, args.timeout, items_per_page=args.ch_items_per_page)
+                if candidates:
+                    break
+            except urllib.error.HTTPError as exc:
+                last_error = f"HTTP {exc.code}"
+                if exc.code == 401:
+                    raise SystemExit("Companies House API key rejected: HTTP 401 Unauthorized")
+                time.sleep(args.ch_sleep)
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(args.ch_sleep)
+
+        for c in candidates:
+            c.score = score_company_match(item.name, c.title)
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        best = candidates[0] if candidates else None
+
+        if best and best.score >= args.match_threshold and best.company_number not in seen_company_numbers:
+            seen_company_numbers.add(best.company_number)
+            accepted.append(Company(
+                ticker=item.ticker or best.company_number,
+                company_number=best.company_number,
+                name=best.title or item.name,
+                isin=item.isin,
+                lei=item.lei,
+                lse_market=item.market,
+                lse_source=item.source,
+                match_score=best.score,
+            ))
+        else:
+            review_rows.append({
+                "ticker": item.ticker,
+                "lse_name": item.name,
+                "isin": item.isin,
+                "lei": item.lei,
+                "market": item.market,
+                "instrument_type": item.instrument_type,
+                "status": "no_ch_match" if not best else "low_score_or_duplicate",
+                "best_company_number": best.company_number if best else "",
+                "best_title": best.title if best else "",
+                "best_score": f"{best.score:.4f}" if best else "",
+                "best_status": best.company_status if best else "",
+                "error": last_error,
+                "candidates_json": json.dumps([dataclasses.asdict(c) for c in candidates[:5]], ensure_ascii=False),
+            })
+        if args.ch_sleep:
+            time.sleep(args.ch_sleep)
+
+    if accepted_output:
+        write_universe_csv(accepted_output, accepted)
+        log(f"CH backfill accepted universe: {len(accepted)} -> {accepted_output}")
+    if review_output:
+        write_review_csv(review_output, review_rows)
+        log(f"CH backfill review rows: {len(review_rows)} -> {review_output}")
+
+    return UniverseBuildResult(accepted=accepted, review_rows=review_rows, raw_rows=list(rows))
+
+
 def write_lse_raw_rows(path: Path, rows: Sequence[LseRow]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     base_fields = ["ticker", "name", "isin", "lei", "market", "instrument_type", "source"]
@@ -878,6 +1038,161 @@ def write_lse_raw_rows(path: Path, rows: Sequence[LseRow]) -> None:
             for k in raw_keys:
                 row[f"raw_{k}"] = item.raw.get(k, "")
             writer.writerow(row)
+
+
+def lse_row_key(item: LseRow) -> str:
+    if item.isin:
+        return f"isin:{item.isin.upper()}"
+    if item.ticker:
+        return f"ticker:{item.ticker}"
+    return f"name:{compact_name(item.name)}"
+
+
+def match_nsm_report_for_lse_row(item: LseRow, reports: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    indexes = build_nsm_match_indexes(reports)
+    return match_nsm_report_for_lse_row_indexed(item, indexes)
+
+
+def latest_nsm_reports(reports: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for report in reports:
+        if not str(report.get("download_link") or "").strip():
+            continue
+        key = nsm_report_key(report)
+        if key and key not in latest:
+            latest[key] = report
+    return list(latest.values())
+
+
+def build_nsm_match_indexes(reports: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    latest = latest_nsm_reports(reports)
+    by_lei: Dict[str, Dict[str, Any]] = {}
+    by_compact: Dict[str, Dict[str, Any]] = {}
+    compact_pairs: List[Tuple[str, Dict[str, Any]]] = []
+    for report in latest:
+        lei = str(report.get("lei") or "").strip().upper()
+        name = str(report.get("company") or "").strip().rstrip(";")
+        compact = compact_name(name)
+        if lei:
+            by_lei.setdefault(lei, report)
+        if compact:
+            by_compact.setdefault(compact, report)
+            compact_pairs.append((compact, report))
+    return {"by_lei": by_lei, "by_compact": by_compact, "compact_pairs": compact_pairs}
+
+
+def match_nsm_report_for_lse_row_indexed(item: LseRow, indexes: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    lei = item.lei.strip().upper()
+    if lei and lei in indexes["by_lei"]:
+        return indexes["by_lei"][lei]
+    target = compact_name(item.name)
+    if not target:
+        return None
+    exact = indexes["by_compact"].get(target)
+    if exact:
+        return exact
+    for report_compact, report in indexes["compact_pairs"]:
+        if len(target) >= 8 and len(report_compact) >= 8 and (target in report_compact or report_compact in target):
+            return report
+    return None
+
+
+def collect_lse_full_nsm_esef_accounts(
+    lse_rows: Sequence[LseRow],
+    reports: Sequence[Dict[str, Any]],
+    audit_path: Path,
+) -> List[ExtractedAccount]:
+    extracted: List[ExtractedAccount] = []
+    audit_rows: List[Dict[str, Any]] = []
+    indexes = build_nsm_match_indexes(reports)
+    seen_lse = set()
+    total = len(lse_rows)
+    for idx, item in enumerate(lse_rows, 1):
+        if idx % 500 == 0:
+            log(f"LSE full universe matching... {idx}/{total}")
+        key = lse_row_key(item)
+        if key in seen_lse:
+            continue
+        seen_lse.add(key)
+        report = match_nsm_report_for_lse_row_indexed(item, indexes)
+        if not report:
+            audit_rows.append(
+                {
+                    "ticker": item.ticker,
+                    "name": item.name,
+                    "isin": item.isin,
+                    "lei": item.lei,
+                    "market": item.market,
+                    "instrument_type": item.instrument_type,
+                    "status": "missing_nsm_tagged_esef",
+                    "matched_company": "",
+                    "matched_lei": "",
+                    "url": "",
+                }
+            )
+            continue
+        raw_url = str(report.get("download_link") or "").strip()
+        url = urllib.parse.urljoin(FCA_ARTEFACT_BASE, raw_url)
+        audit_status = "matched_nsm_tagged_esef"
+        fiscal_year = None
+        document_date = str(report.get("document_date") or "")
+        if re.match(r"\d{4}", document_date):
+            fiscal_year = int(document_date[:4])
+        extracted.append(
+            ExtractedAccount(
+                company=Company(
+                    ticker=item.ticker or str(report.get("lei") or "").strip().upper() or normalize_ticker(item.name),
+                    company_number="",
+                    name=str(report.get("company") or item.name).strip().rstrip(";"),
+                    isin=item.isin,
+                    lei=str(report.get("lei") or item.lei).strip(),
+                    lse_market=item.market,
+                    lse_source=item.source,
+                ),
+                source_zip="fca-nsm",
+                inner_name=str(report.get("disclosure_id") or report.get("seq_id") or ""),
+                file_path="",
+                fiscal_year=fiscal_year,
+                url=url,
+            )
+        )
+        audit_rows.append(
+            {
+                "ticker": item.ticker,
+                "name": item.name,
+                "isin": item.isin,
+                "lei": item.lei,
+                "market": item.market,
+                "instrument_type": item.instrument_type,
+                "status": audit_status,
+                "matched_company": str(report.get("company") or "").strip().rstrip(";"),
+                "matched_lei": str(report.get("lei") or "").strip(),
+                "url": url,
+            }
+        )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with audit_path.open("w", encoding="utf-8-sig", newline="") as f:
+        fields = ["ticker", "name", "isin", "lei", "market", "instrument_type", "status", "matched_company", "matched_lei", "url"]
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in audit_rows:
+            writer.writerow(row)
+    log(f"LSE full universe audit: {audit_path}")
+    return extracted
+
+
+def lse_rows_missing_nsm_esef(lse_rows: Sequence[LseRow], reports: Sequence[Dict[str, Any]]) -> List[LseRow]:
+    indexes = build_nsm_match_indexes(reports)
+    missing: List[LseRow] = []
+    seen_lse = set()
+    for item in lse_rows:
+        key = lse_row_key(item)
+        if key in seen_lse:
+            continue
+        seen_lse.add(key)
+        if not match_nsm_report_for_lse_row_indexed(item, indexes):
+            missing.append(item)
+    return missing
 
 
 def write_universe_csv(path: Path, companies: Sequence[Company]) -> None:
@@ -1058,6 +1373,61 @@ def extract_matching_accounts(zip_path: Path, extract_dir: Path, companies: Dict
                 with zf.open(info, "r") as src, out_path.open("wb") as dst:
                     shutil.copyfileobj(src, dst)
             extracted.append(ExtractedAccount(company=company, source_zip=str(zip_path), inner_name=name, file_path=str(out_path), fiscal_year=fiscal_year))
+    return extracted
+
+
+def collect_companies_house_accounts(args: argparse.Namespace, companies: Dict[str, Company]) -> List[ExtractedAccount]:
+    if not companies:
+        return []
+    log("Discovering Companies House bulk ZIP links for CH backfill...")
+    all_zips = collect_bulk_zips(args.include_daily, args.include_monthly, args.timeout)
+    filtered = filter_zips(all_zips, args.from_year, args.to_year, parse_date(args.from_date), parse_date(args.to_date))
+    if args.max_zip_files:
+        filtered = filtered[: args.max_zip_files]
+    log(f"CH backfill bulk ZIP candidates: {len(filtered)}")
+    for item in filtered[:20]:
+        log(f"  {item.date} [{item.kind}] {item.label}")
+    if len(filtered) > 20:
+        log(f"  ... +{len(filtered) - 20} more")
+    if args.dry_run:
+        return []
+    if not filtered and not args.skip_download:
+        raise SystemExit("No Companies House bulk ZIP candidates after filters.")
+
+    extracted: List[ExtractedAccount] = []
+    args.download_dir.mkdir(parents=True, exist_ok=True)
+    args.extract_dir.mkdir(parents=True, exist_ok=True)
+
+    local_zips: List[Path] = []
+    if args.skip_download:
+        local_zips = sorted(args.download_dir.glob("*.zip"))
+        log(f"Using existing Companies House ZIPs: {len(local_zips)}")
+    else:
+        for idx, item in enumerate(filtered, 1):
+            zip_path = args.download_dir / item.label
+            if not zip_path.exists() or zip_path.stat().st_size == 0:
+                log(f"[CH {idx}/{len(filtered)}] Downloading {item.label}")
+                try:
+                    download_file(item.url, zip_path, args.timeout)
+                    time.sleep(args.sleep)
+                except urllib.error.HTTPError as exc:
+                    log(f"HTTP error {exc.code}; skipped {item.url}")
+                    continue
+                except Exception as exc:
+                    log(f"Download failed; skipped {item.url}: {exc}")
+                    continue
+            else:
+                log(f"[CH {idx}/{len(filtered)}] Reusing {zip_path.name}")
+            local_zips.append(zip_path)
+
+    for zip_path in local_zips:
+        try:
+            rows = extract_matching_accounts(zip_path, args.extract_dir, companies)
+            if rows:
+                log(f"  extracted {len(rows)} CH matching accounts from {zip_path.name}")
+            extracted.extend(rows)
+        except zipfile.BadZipFile:
+            log(f"  bad ZIP skipped: {zip_path}")
     return extracted
 
 
@@ -1336,6 +1706,8 @@ def run_builder(args: argparse.Namespace, manifest_path: Path) -> int:
         cmd.append("--rebuild-existing")
     if args.allow_missing_ticker:
         cmd.append("--allow-missing-ticker")
+    if getattr(args, "universe_all_csv", None):
+        cmd.extend(["--universe-all-csv", str(args.universe_all_csv)])
     log("Running builder:")
     log(" ".join(f'\"{c}\"' if " " in c else c for c in cmd))
     return subprocess.call(cmd)
@@ -1354,6 +1726,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--universe-output", help="Auto-created accepted universe CSV; default <work-dir>/uk_universe.csv")
     parser.add_argument("--review-output", help="Auto-created ambiguous/no-match review CSV; default <work-dir>/uk_universe_review.csv")
     parser.add_argument("--lse-raw-output", help="Raw parsed LSE rows CSV; default <work-dir>/uk_lse_raw_rows.csv")
+    parser.add_argument("--lse-full-universe", action="store_true", help="Use LSE issuer/instrument report as the full UK universe and audit missing official fundamentals")
+    parser.add_argument("--lse-full-audit-output", help="LSE full universe match audit CSV; default <work-dir>/uk_lse_full_universe_audit.csv")
+    parser.add_argument("--ch-backfill-missing-lse", action="store_true", help="After NSM ESEF matching, map missing LSE rows to Companies House and add CH iXBRL accounts to the same build")
+    parser.add_argument("--ch-backfill-universe-output", help="Accepted Companies House backfill universe CSV; default <work-dir>/uk_ch_backfill_universe.csv")
+    parser.add_argument("--ch-backfill-review-output", help="Companies House backfill no/low match review CSV; default <work-dir>/uk_ch_backfill_review.csv")
+    parser.add_argument("--max-ch-backfill-rows", type=int, help="Limit missing LSE rows mapped to Companies House for smoke tests")
     parser.add_argument("--universe-only", action="store_true", help="Only build universe/review CSV; do not collect CH accounts")
 
     # LSE options
@@ -1419,6 +1797,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     manifest_path = Path(args.manifest_output) if args.manifest_output else work_dir / "uk_ch_manifest.csv"
     universe_output = Path(args.universe_output) if args.universe_output else work_dir / "uk_universe.csv"
     review_output = Path(args.review_output) if args.review_output else work_dir / "uk_universe_review.csv"
+    lse_full_audit_output = Path(args.lse_full_audit_output) if args.lse_full_audit_output else work_dir / "uk_lse_full_universe_audit.csv"
+    ch_backfill_universe_output = Path(args.ch_backfill_universe_output) if args.ch_backfill_universe_output else work_dir / "uk_ch_backfill_universe.csv"
+    ch_backfill_review_output = Path(args.ch_backfill_review_output) if args.ch_backfill_review_output else work_dir / "uk_ch_backfill_review.csv"
     args.cache_output = Path(args.cache_output)
     args.audit_output = Path(args.audit_output)
     args.builder_download_dir = Path(args.builder_download_dir)
@@ -1432,11 +1813,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.universe_csv = str(universe_output)
         if args.universe_only:
             return 0 if result.accepted else 1
-    elif not args.universe_csv and not (args.source == "nsm" and args.nsm_all):
+    elif not args.universe_csv and not (args.source == "nsm" and (args.nsm_all or args.lse_full_universe)):
         parser.error("Use --universe-csv or --auto-universe. Use --write-example-universe for a manual template.")
 
     if args.source == "nsm":
-        if args.nsm_all:
+        if args.lse_full_universe:
+            reports = fca_nsm_search_tagged_annual_reports(args.timeout)
+            lse_rows = load_lse_rows(args)
+            lse_universe_path = universe_output
+            write_lse_raw_rows(lse_universe_path, lse_rows)
+            args.universe_all_csv = lse_universe_path
+            log(f"LSE full universe rows: {len(lse_rows)} -> {lse_universe_path}")
+            extracted = collect_lse_full_nsm_esef_accounts(lse_rows, reports, lse_full_audit_output)
+            nsm_extracted_count = len(extracted)
+            if args.ch_backfill_missing_lse:
+                missing_lse_rows = lse_rows_missing_nsm_esef(lse_rows, reports)
+                log(f"LSE rows missing NSM ESEF before CH backfill: {len(missing_lse_rows)}")
+                ch_result = map_lse_rows_to_companies_house(
+                    args,
+                    missing_lse_rows,
+                    accepted_output=ch_backfill_universe_output,
+                    review_output=ch_backfill_review_output,
+                )
+                ch_companies = {company.company_number: company for company in ch_result.accepted if company.company_number}
+                ch_extracted = collect_companies_house_accounts(args, ch_companies)
+                log(f"CH backfill extracted account files: {len(ch_extracted)}")
+                extracted.extend(ch_extracted)
+            if args.nsm_limit:
+                extracted = extracted[: args.nsm_limit]
+            log(f"LSE full universe NSM ESEF matches: {nsm_extracted_count}/{len(lse_rows)}")
+            if args.ch_backfill_missing_lse:
+                log(f"LSE full universe total official filing candidates after CH backfill: {len(extracted)}/{len(lse_rows)}")
+        elif args.nsm_all:
             reports = fca_nsm_search_tagged_annual_reports(args.timeout)
             ticker_map: Dict[str, str] = {}
             if args.nsm_map_lse_tickers:
@@ -1463,7 +1871,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_manifest(manifest_path, extracted)
         log(f"NSM ESEF manifest rows: {len(extracted)}")
         log(f"Manifest: {manifest_path}")
-        if not extracted:
+        if not extracted and not getattr(args, "universe_all_csv", None):
             log("No NSM ESEF matches; builder not run.")
             return 2
         if args.build_cache:

@@ -967,6 +967,83 @@ def write_audit(path: Path, rows: Sequence[AuditRow]) -> None:
             writer.writerow(dataclasses.asdict(row))
 
 
+def universe_placeholder_record(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ticker = normalize_ticker(first_value(row, ("ticker", "symbol", "code", "epic", "ric")))
+    name = first_value(row, ("name", "company", "issuer", "issuer_name", "company_name", "security_name")) or ticker
+    if not ticker:
+        return None
+    isin = first_value(row, ("isin", "ISIN"))
+    lei = first_value(row, ("lei", "LEI"))
+    market = first_value(row, ("market", "lse_market", "segment", "admission_market"))
+    instrument_type = first_value(row, ("instrument_type", "type", "security_type", "asset_class", "category"))
+    return {
+        "country": "UK",
+        "code": ticker,
+        "name": name,
+        "price": "N/A",
+        "per": "N/A",
+        "pbr": "N/A",
+        "liabilities_ratio": "N/A",
+        "interest_bearing_debt_ratio": "N/A",
+        "net_cash_per_share": "N/A",
+        "net_cash_per_share_ratio": "N/A",
+        "net_cash_per_share_value": None,
+        "sales": "N/A",
+        "op_income": "N/A",
+        "equity": "N/A",
+        "sales_growth_5y": "N/A",
+        "op_growth_5y": "N/A",
+        "net_income_growth_5y": "N/A",
+        "sales_growth_5y_avg_pct": None,
+        "op_growth_5y_avg_pct": None,
+        "net_income_growth_5y_avg_pct": None,
+        "liabilities_ratio_value": None,
+        "interest_bearing_debt_ratio_value": None,
+        "liquid_funds_total": None,
+        "liquid_funds": None,
+        "interest_bearing_debt": None,
+        "net_cash": None,
+        "quote_source": "yahoo",
+        "fundamentals_source": "missing",
+        "fundamentals_status": "missing_official_fundamentals",
+        "quote_status": "unknown",
+        "isin": isin,
+        "lei": lei,
+        "lse_market": market,
+        "instrument_type": instrument_type,
+        "source_file": "",
+        "source_file_count": 0,
+        "coverage": {
+            "revenue": False,
+            "operating_income": False,
+            "net_income": False,
+            "cash": False,
+            "equity": False,
+            "liabilities": False,
+            "interest_bearing_debt": False,
+            "shares": False,
+        },
+        "bsns_year": "-",
+        "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+
+
+def seed_universe_placeholders(records: Dict[str, Dict[str, Any]], path: Optional[str], audit: List[AuditRow]) -> int:
+    if not path:
+        return 0
+    count = 0
+    for row in read_table(Path(path)):
+        record = universe_placeholder_record(row)
+        if not record:
+            continue
+        code = record["code"]
+        if code not in records:
+            records[code] = record
+            count += 1
+            audit.append(AuditRow(code, record.get("name", code), str(path), "universe_placeholder", "no official fundamentals matched yet"))
+    return count
+
+
 def dedupe_candidates(candidates: Iterable[FilingCandidate]) -> List[FilingCandidate]:
     seen = set()
     out = []
@@ -996,7 +1073,7 @@ def build(args: argparse.Namespace) -> int:
     candidates = dedupe_candidates(candidates)
     if args.limit:
         candidates = candidates[: args.limit]
-    if not candidates:
+    if not candidates and not args.universe_all_csv:
         print("No candidates. Provide --manifest, --nsm-csv, --input, or --input-dir.", file=sys.stderr)
         return 2
 
@@ -1057,22 +1134,27 @@ def build(args: argparse.Namespace) -> int:
     for code, facts in company_facts.items():
         try:
             record = build_cache_record(code, company_names.get(code, code), facts, company_sources.get(code, []), args.years)
+            record["fundamentals_status"] = "official_fundamentals_loaded"
             records[code] = record
             built += 1
             audit.append(AuditRow(code, record.get("name", code), record.get("source_file", ""), "record_built", "ok", output_record=json.dumps(record.get("coverage", {}), ensure_ascii=False)))
         except Exception as exc:
             audit.append(AuditRow(code, company_names.get(code, code), "merged_facts", "record_error", str(exc)))
 
-    if built:
+    placeholder_count = seed_universe_placeholders(records, getattr(args, "universe_all_csv", None), audit)
+
+    if built or placeholder_count:
         write_jsonl_atomic(output_path, records)
     write_audit(Path(args.audit_output), audit)
 
     print(f"Candidates: {len(candidates)}")
     print(f"Parsed documents: {parsed_docs}")
     print(f"Built/updated records: {built}")
+    if placeholder_count:
+        print(f"Missing official fundamentals placeholders: {placeholder_count}")
     print(f"Output: {output_path}")
     print(f"Audit: {args.audit_output}")
-    return 0 if built else 1
+    return 0 if built or placeholder_count else 1
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1080,6 +1162,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--manifest", action="append", help="CSV/JSON/JSONL manifest with ticker/name/url/file_path/isin/lei")
     parser.add_argument("--nsm-csv", action="append", help="FCA NSM exported CSV search results containing structured AFR rows and URLs")
     parser.add_argument("--universe-csv", help="Ticker mapping CSV with ticker,name,isin,lei columns")
+    parser.add_argument("--universe-all-csv", help="Full exchange universe CSV; rows without matched official filings are written as missing placeholders")
     parser.add_argument("--input", action="append", help="Local ESEF/iXBRL .zip/.xbri/.xhtml/.html/.xml file; repeatable")
     parser.add_argument("--input-dir", action="append", help="Directory to recursively scan for local ESEF/iXBRL files; repeatable")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Output JSONL path; default data/uk_fundamentals_cache.jsonl")
