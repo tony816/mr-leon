@@ -1428,6 +1428,13 @@ def collect_companies_house_accounts(args: argparse.Namespace, companies: Dict[s
             extracted.extend(rows)
         except zipfile.BadZipFile:
             log(f"  bad ZIP skipped: {zip_path}")
+        finally:
+            if getattr(args, "delete_bulk_zip_after_extract", False):
+                try:
+                    zip_path.unlink(missing_ok=True)
+                    log(f"  deleted CH bulk ZIP after extract: {zip_path.name}")
+                except Exception as exc:
+                    log(f"  could not delete CH bulk ZIP {zip_path}: {exc}")
     return extracted
 
 
@@ -1774,6 +1781,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--from-date", help="Optional lower date YYYY-MM-DD based on bulk file date")
     parser.add_argument("--to-date", help="Optional upper date YYYY-MM-DD based on bulk file date")
     parser.add_argument("--max-zip-files", type=int, help="Limit number of bulk ZIPs for smoke test")
+    parser.add_argument("--delete-bulk-zip-after-extract", action="store_true", help="Delete Companies House bulk ZIPs after extracting matching accounts to save disk space")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--sleep", type=float, default=0.5, help="Sleep seconds between bulk downloads")
     parser.add_argument("--dry-run", action="store_true", help="Only list matching bulk ZIPs; do not download/extract/build")
@@ -1919,6 +1927,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 extracted.extend(rows)
             except zipfile.BadZipFile:
                 log(f"Bad ZIP skipped: {zip_path}")
+            finally:
+                if args.delete_bulk_zip_after_extract:
+                    try:
+                        zip_path.unlink(missing_ok=True)
+                        log(f"Deleted bulk ZIP after extract: {zip_path.name}")
+                    except Exception as exc:
+                        log(f"Could not delete bulk ZIP {zip_path}: {exc}")
     else:
         for idx, item in enumerate(filtered, 1):
             zip_path = args.download_dir / item.label
@@ -1942,6 +1957,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 extracted.extend(rows)
             except zipfile.BadZipFile:
                 log(f"  bad ZIP skipped: {zip_path}")
+            finally:
+                if args.delete_bulk_zip_after_extract:
+                    try:
+                        zip_path.unlink(missing_ok=True)
+                        log(f"  deleted bulk ZIP after extract: {zip_path.name}")
+                    except Exception as exc:
+                        log(f"  could not delete bulk ZIP {zip_path}: {exc}")
 
     write_manifest(manifest_path, extracted)
     log(f"Extracted account files: {len(extracted)}")
