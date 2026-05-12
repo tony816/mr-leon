@@ -2708,6 +2708,54 @@ def cache_record_passes_filters(
     )
 
 
+def cache_record_can_pass_static_filters(
+    record: Dict[str, Any],
+    debt_min: Optional[float],
+    debt_max: Optional[float],
+    ib_debt_min: Optional[float],
+    ib_debt_max: Optional[float],
+    ncsr_min: Optional[float],
+    sales_delta_min: Optional[float],
+    op_delta_min: Optional[float],
+    net_delta_min: Optional[float],
+) -> bool:
+    if record.get("fundamentals_status") == "missing_official_fundamentals":
+        return False
+
+    debt_val = parse_float(record.get("liabilities_ratio"))
+    ib_val = parse_float(record.get("interest_bearing_debt_ratio"))
+    if not in_range(debt_val, debt_min, debt_max):
+        return False
+    if not in_range(ib_val, ib_debt_min, ib_debt_max):
+        return False
+
+    if ncsr_min is not None and ncsr_min > 0:
+        net_cash_ps = parse_float(record.get("net_cash_per_share_value"))
+        if net_cash_ps is None:
+            net_cash_ps = parse_float(record.get("net_cash_per_share"))
+        net_cash = parse_float(record.get("net_cash"))
+        if net_cash_ps is None and net_cash is None:
+            return False
+        if net_cash_ps is not None and net_cash_ps <= 0:
+            return False
+        if net_cash_ps is None and net_cash is not None and net_cash <= 0:
+            return False
+
+    def growth_can_pass(delta_min: Optional[float], growth_key: str) -> bool:
+        if delta_min is None:
+            return True
+        growth_val = parse_float(record.get(growth_key))
+        if growth_val is None or growth_val <= 0:
+            return False
+        return growth_val > delta_min
+
+    return (
+        growth_can_pass(sales_delta_min, "sales_growth_5y_avg_pct")
+        and growth_can_pass(op_delta_min, "op_growth_5y_avg_pct")
+        and growth_can_pass(net_delta_min, "net_income_growth_5y_avg_pct")
+    )
+
+
 def scan_cached_fundamentals_records(
     country: str,
     records: List[Dict[str, Any]],
@@ -2728,12 +2776,37 @@ def scan_cached_fundamentals_records(
     quote_fetcher: Callable[[List[str]], Dict[str, Dict[str, Optional[float]]]] = fetch_yahoo_quotes_batch,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Tuple[Any, ...]], int, Optional[str]]:
-    enriched = enrich_cache_records_with_yahoo(
-        records,
-        country,
-        quote_fetcher=quote_fetcher,
-        progress_cb=progress_cb,
-    )
+    original_total = len(records)
+    quote_candidates = records
+    if country == "KR":
+        quote_candidates = [
+            record
+            for record in records
+            if cache_record_can_pass_static_filters(
+                record,
+                debt_min,
+                debt_max,
+                ib_debt_min,
+                ib_debt_max,
+                ncsr_min,
+                sales_delta_min,
+                op_delta_min,
+                net_delta_min,
+            )
+        ]
+        if progress_cb:
+            progress_cb(f"KR cache prefilter... {len(quote_candidates)}/{original_total} quote candidates")
+
+    try:
+        enriched = enrich_cache_records_with_yahoo(
+            quote_candidates,
+            country,
+            quote_fetcher=quote_fetcher,
+            progress_cb=progress_cb,
+        )
+    except Exception as exc:
+        return [], original_total, str(exc)
+
     rows: List[Tuple[Any, ...]] = []
     last_error = None
     for record in enriched:
@@ -2758,7 +2831,13 @@ def scan_cached_fundamentals_records(
             rows.append(cache_record_to_scan_values(record))
         except Exception as exc:
             last_error = str(exc)
-    return rows, len(enriched), last_error
+    return rows, original_total, last_error
+
+
+def quote_has_usable_values(quote: Optional[Dict[str, Any]]) -> bool:
+    if not quote:
+        return False
+    return any(quote.get(key) is not None for key in ("price", "per", "pbr", "market_cap"))
 
 
 def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str, Any]]) -> None:
@@ -2846,6 +2925,47 @@ def enrich_cache_records_with_yahoo(
     if country == "JP":
         return enrich_jp_cache_records_with_yahoo(records, quote_fetcher=quote_fetcher, progress_cb=progress_cb)
     enriched = [dict(record) for record in records]
+    if country == "KR":
+        quote_source_label = "Yahoo"
+        if quote_fetcher is fetch_yahoo_quotes_batch and kis_quote_configured():
+            quote_fetcher = fetch_kis_quotes_batch
+            quote_source_label = "KIS"
+        code_to_record = {
+            str(record.get("code") or "").strip().upper(): record
+            for record in enriched
+            if str(record.get("code") or "").strip()
+        }
+        applied_codes = set()
+
+        def fetch_and_apply(symbols: List[str], stage: str) -> None:
+            for offset in range(0, len(symbols), 200):
+                chunk = symbols[offset : offset + 200]
+                if progress_cb:
+                    progress_cb(
+                        f"KR quotes {stage} ({quote_source_label})... {min(offset + len(chunk), len(symbols))}/{len(symbols)} symbols"
+                    )
+                try:
+                    quotes = quote_fetcher(chunk)
+                except Exception as exc:
+                    raise KisError(f"KR quote fetch failed during {stage}: {exc}") from exc
+                for symbol in chunk:
+                    quote = quotes.get(symbol)
+                    if not quote_has_usable_values(quote):
+                        continue
+                    code = symbol.split(".", 1)[0].upper()
+                    record = code_to_record.get(code)
+                    if not record or code in applied_codes:
+                        continue
+                    apply_quote_to_cache_record(record, quote)
+                    applied_codes.add(code)
+
+        kospi_symbols = [f"{code}.KS" for code in code_to_record]
+        fetch_and_apply(kospi_symbols, "KR" if quote_source_label == "KIS" else "KOSPI")
+        kosdaq_symbols = [f"{code}.KQ" for code in code_to_record if code not in applied_codes]
+        if kosdaq_symbols and quote_source_label != "KIS":
+            fetch_and_apply(kosdaq_symbols, "KOSDAQ fallback")
+        return enriched
+
     symbol_to_records: Dict[str, List[Dict[str, Any]]] = {}
     symbols = []
     if country == "US" and quote_fetcher is fetch_yahoo_quotes_batch:
@@ -2859,8 +2979,8 @@ def enrich_cache_records_with_yahoo(
             symbols.append(symbol)
             symbol_to_records.setdefault(symbol, []).append(record)
     applied_record_ids = set()
-    for offset in range(0, len(symbols), 100):
-        chunk = symbols[offset : offset + 100]
+    for offset in range(0, len(symbols), 200):
+        chunk = symbols[offset : offset + 200]
         if progress_cb:
             progress_cb(f"{country} quotes... {min(offset + len(chunk), len(symbols))}/{len(symbols)}")
         try:
@@ -3419,6 +3539,53 @@ class KisClient:
         snapshot.cash = cash
         snapshot.debt_ratio = debt_ratio
         return snapshot
+
+
+def kis_quote_configured() -> bool:
+    return bool(os.getenv("KIS_APP_KEY") and os.getenv("KIS_APP_SECRET"))
+
+
+def fetch_kis_quotes_batch(tickers: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    app_key, app_secret, base_url = load_keys()
+    client = KisClient(app_key, app_secret, base_url=base_url)
+    quotes: Dict[str, Dict[str, Optional[float]]] = {}
+    seen_codes = set()
+    last_error = None
+
+    for raw_symbol in tickers or []:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            continue
+        code = normalize_scan_code_for_country(symbol.split(".", 1)[0], "KR")
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        try:
+            snapshot = client.get_price_snapshot(code)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        price = parse_float(snapshot.price)
+        per_val = parse_float(snapshot.per)
+        pbr_val = parse_float(snapshot.pbr)
+        market_cap = price * snapshot.listed_shares if price is not None and snapshot.listed_shares else None
+        quote = {
+            "symbol": symbol or code,
+            "price": price,
+            "per": per_val,
+            "pbr": pbr_val,
+            "market_cap": market_cap,
+            "currency": "KRW",
+            "source": "kis",
+        }
+        for alias in {symbol, code, f"{code}.KS", f"{code}.KQ"}:
+            if alias:
+                quotes[alias.upper()] = quote
+
+    if not quotes and last_error:
+        raise KisError(last_error)
+    return quotes
 
 
 def extract_edgar_scan_fundamentals(facts: Dict) -> Dict[str, Any]:
@@ -4193,9 +4360,7 @@ def build_gui():
         net_delta_min_var = tk.StringVar(value="0")
         country_checks = {country: tk.BooleanVar(value=(country == selected_country)) for country in COUNTRY_CHOICES}
         initial_cache_status = (
-            "KR uses the official live scan path until the KR cache is complete."
-            if selected_country == "KR"
-            else fundamentals_cache_status(selected_country)
+            fundamentals_cache_status(selected_country)
             if fundamentals_cache_path(selected_country)
             else "범위를 입력하거나 All을 체크 후 Scan을 눌러주세요."
         )
@@ -4472,7 +4637,7 @@ def build_gui():
                             if not records:
                                 set_scan_status(f"{scan_country} cache not found. Build the fundamentals cache first.")
                                 continue
-                            set_scan_status(f"{scan_country} cache loaded; fetching batch quotes...")
+                            set_scan_status(f"{scan_country} cache loaded; preparing quote enrichment...")
                             rows, total, cache_error = scan_cached_fundamentals_records(
                                 scan_country,
                                 records,

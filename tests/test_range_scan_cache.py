@@ -273,7 +273,6 @@ class RangeScanCacheTests(unittest.TestCase):
 
     def test_cached_scan_uses_country_quote_symbols_and_cache_fallbacks(self):
         cases = [
-            ("KR", "005930", ["005930.KS", "005930.KQ"], "005930.KS"),
             ("JP", "7203", ["7203.T"], "7203.T"),
             ("UK", "BP", ["BP.L"], "BP.L"),
         ]
@@ -309,6 +308,49 @@ class RangeScanCacheTests(unittest.TestCase):
                 self.assertEqual(app.parse_float(enriched[0]["per"]), 20.0)
                 self.assertEqual(app.parse_float(enriched[0]["pbr"]), 5.0)
                 self.assertEqual(enriched[0]["net_cash_per_share_ratio"], "50.00%")
+
+    def test_kr_cached_scan_falls_back_to_kosdaq_when_kospi_quote_is_empty(self):
+        records = [
+            {
+                "country": "KR",
+                "code": "123456",
+                "shares": 100,
+                "net_income": 50,
+                "equity": 200,
+                "net_cash_per_share_value": 5,
+            }
+        ]
+        calls = []
+
+        def quote_fetcher(symbols):
+            calls.append(list(symbols))
+            if symbols == ["123456.KS"]:
+                return {
+                    "123456.KS": {
+                        "symbol": "123456.KS",
+                        "price": None,
+                        "per": None,
+                        "pbr": None,
+                        "market_cap": None,
+                        "source": "yahoo",
+                    }
+                }
+            return {
+                "123456.KQ": {
+                    "symbol": "123456.KQ",
+                    "price": 10,
+                    "per": None,
+                    "pbr": None,
+                    "source": "yahoo",
+                }
+            }
+
+        enriched = app.enrich_cache_records_with_yahoo(records, "KR", quote_fetcher=quote_fetcher)
+
+        self.assertEqual(calls, [["123456.KS"], ["123456.KQ"]])
+        self.assertEqual(app.parse_float(enriched[0]["per"]), 20.0)
+        self.assertEqual(app.parse_float(enriched[0]["pbr"]), 5.0)
+        self.assertEqual(enriched[0]["net_cash_per_share_ratio"], "50.00%")
 
     def test_net_cash_ratio_falls_back_to_market_cap_when_shares_missing(self):
         record = {
@@ -483,8 +525,8 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(total, 201)
         self.assertIsNone(last_error)
         self.assertEqual(len(rows), 201)
-        self.assertEqual(len(calls), 3)
-        self.assertEqual([len(call) for call in calls], [100, 100, 1])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([len(call) for call in calls], [200, 1])
 
 
 if __name__ == "__main__":
