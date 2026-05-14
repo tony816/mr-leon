@@ -2226,6 +2226,62 @@ def fetch_jquants_financials_with_client(
     return snapshot, detail
 
 
+def build_jquants_listing_only_cache_record(
+    code: str,
+    client: JQuantsClient,
+    *,
+    include_price: bool = False,
+    error: str = "No J-Quants financial statements found.",
+) -> Dict[str, Any]:
+    info_list = client.get_listed_info(code)
+    info = info_list[0] if info_list else {}
+    quote = latest_jquants_quote(client.get_daily_quotes(code)) if include_price else {}
+    name = jquants_first(info, "CompanyNameEnglish", "CoNameEn", "CompanyName", "CoName", "Name", default=code)
+    price_val = jquants_value(quote, "AdjustmentClose", "AdjC", "Close", "C")
+    snapshot = PriceSnapshot(
+        name=str(name),
+        code=code,
+        price=clean_number(price_val) if price_val is not None else "N/A",
+        per="N/A",
+        pbr="N/A",
+        cash="N/A",
+        debt_ratio="N/A",
+        listed_shares=None,
+        net_cash_per_share_ratio="N/A",
+    )
+    detail = {
+        "corp_name": str(name),
+        "corp_code": code,
+        "bsns_year": "-",
+        "summary": {"sales": "N/A", "op_income": "N/A", "equity": "N/A"},
+        "sales_growth_5y": "N/A",
+        "op_growth_5y": "N/A",
+        "net_income_growth_5y": "N/A",
+        "sales_growth_5y_avg_pct": None,
+        "op_growth_5y_avg_pct": None,
+        "net_income_growth_5y_avg_pct": None,
+        "liquid_funds_total": None,
+        "liquid_funds_source_date": None,
+        "interest_bearing_debt": None,
+        "interest_bearing_debt_source": "missing",
+        "net_cash": None,
+        "net_cash_per_share": "N/A",
+        "net_cash_per_share_ratio": "N/A",
+        "net_cash_per_share_value": None,
+        "liabilities_ratio_value": None,
+        "interest_bearing_debt_ratio": "N/A",
+        "interest_bearing_debt_ratio_value": None,
+        "shares": None,
+        "quote_source": "j-quants",
+        "quote_status": "ok" if quote else "missing",
+        "fundamentals_source": "j-quants",
+        "fundamentals_status": "missing_official_fundamentals",
+        "fundamentals_error": error,
+        "currency": "JPY",
+    }
+    return detail_to_cache_record("JP", snapshot, detail)
+
+
 def jquants_configured() -> bool:
     return bool(
         os.getenv("JQUANTS_API_KEY")
@@ -2550,6 +2606,15 @@ def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[s
     record["interest_bearing_debt"] = detail.get("interest_bearing_debt")
     record["interest_bearing_debt_source"] = detail.get("interest_bearing_debt_source")
     record["shares"] = detail.get("shares") or detail.get("float_shares")
+    for optional_key in (
+        "fundamentals_source",
+        "fundamentals_status",
+        "fundamentals_error",
+        "quote_status",
+        "currency",
+    ):
+        if optional_key in detail:
+            record[optional_key] = detail.get(optional_key)
     return record
 
 
@@ -3370,7 +3435,21 @@ def build_jp_fundamentals_cache(
             except Exception as exc:
                 last_error = str(exc)
                 if "No J-Quants financial statements found" in last_error:
-                    print(f"[{idx}/{len(targets)}] skipped JP {code}: {exc}")
+                    try:
+                        record = build_jquants_listing_only_cache_record(
+                            code,
+                            client,
+                            include_price=include_price,
+                            error=last_error,
+                        )
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        f.flush()
+                        cached_codes.add(code)
+                        written += 1
+                        print(f"[{idx}/{len(targets)}] cached JP {code} {record.get('name')} (listing only)")
+                    except Exception as fallback_exc:
+                        last_error = str(fallback_exc)
+                        print(f"[{idx}/{len(targets)}] failed JP {code}: {fallback_exc}", file=sys.stderr)
                 else:
                     print(f"[{idx}/{len(targets)}] failed JP {code}: {exc}", file=sys.stderr)
     return written, len(targets), last_error
