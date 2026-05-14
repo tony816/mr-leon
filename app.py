@@ -1959,12 +1959,17 @@ def normalize_jp_code(user_text: str) -> str:
     code = (user_text or "").strip().upper()
     code = code[:-2] if code.endswith(".T") else code
     code = re.sub(r"[^0-9A-Z]", "", code)
-    if len(code) >= 5 and code.endswith("0"):
-        code = code[:4]
-    elif len(code) > 4:
-        code = code[:4]
-    if not re.fullmatch(r"[0-9A-Z]{4}", code):
-        raise OfficialDataError("Enter a 4-character Japanese stock code, e.g. 7203 or 130A.")
+    if not re.fullmatch(r"[0-9A-Z]{4,5}", code):
+        raise OfficialDataError("Enter a 4- or 5-character Japanese stock code, e.g. 7203, 130A, or 25935.")
+    return code
+
+
+def normalize_jp_listed_code(raw_code: str) -> str:
+    code = normalize_jp_code(raw_code)
+    # J-Quants listed-info rows may include exchange suffixes such as 72030 for
+    # normal 4-digit stocks. JPX 5-character class share codes must be preserved.
+    if re.fullmatch(r"\d{5}", code) and code.endswith("0"):
+        return code[:4]
     return code
 
 
@@ -2383,6 +2388,19 @@ def env_ticker_list(env_name: str) -> List[str]:
     return [t.strip().upper() for t in re.split(r"[\s,;]+", raw) if t.strip()]
 
 
+def load_symbol_file(path: Path) -> List[str]:
+    text = path.read_text(encoding="utf-8-sig")
+    if path.suffix.lower() == ".csv":
+        reader = csv.DictReader(io.StringIO(text))
+        if reader.fieldnames:
+            code_field = next(
+                (field for field in reader.fieldnames if field and field.strip().lower() in {"code", "local code", "local_code", "symbol", "ticker"}),
+                reader.fieldnames[0],
+            )
+            return [str(row.get(code_field) or "").strip() for row in reader if str(row.get(code_field) or "").strip()]
+    return [item.strip() for item in re.split(r"[\s,;]+", text) if item.strip()]
+
+
 def load_asx_tickers() -> List[Dict[str, str]]:
     resp = requests.get(ASX_LISTED_COMPANIES_URL, timeout=20)
     if resp.status_code != 200:
@@ -2429,7 +2447,11 @@ def load_scan_targets(country: str, status_cb: Optional[Callable[[str], None]] =
             rows = JQuantsClient().get_listed_info()
             targets = []
             for row in rows:
-                code = str(row.get("Code") or row.get("LocalCode") or "").strip()[:4]
+                raw_code = str(row.get("Code") or row.get("LocalCode") or "").strip()
+                try:
+                    code = normalize_jp_listed_code(raw_code)
+                except OfficialDataError:
+                    continue
                 name = str(jquants_first(row, "CompanyNameEnglish", "CoNameEn", "CompanyName", "CoName", "Name", default=code))
                 if code:
                     targets.append({"country": "JP", "ticker": code, "name": name or code})
@@ -3297,24 +3319,39 @@ def build_jp_fundamentals_cache(
     limit: Optional[int] = None,
     force: bool = False,
     include_price: bool = False,
+    target_codes: Optional[Iterable[str]] = None,
 ) -> Tuple[int, int, Optional[str]]:
     if limit is not None and limit <= 0:
         return 0, 0, None
     client = JQuantsClient()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cached_codes = set() if force else load_cached_codes(output_path)
-    print("JP cache: loading J-Quants listed info...", flush=True)
-    rows = client.get_listed_info()
-    print(f"JP cache: loaded {len(rows)} listed rows; preparing targets...", flush=True)
     targets = []
-    for row in rows:
-        raw_code = str(row.get("Code") or row.get("LocalCode") or "").strip()
-        try:
-            code = normalize_jp_code(raw_code)
-        except OfficialDataError:
-            continue
-        if code and (force or code not in cached_codes):
-            targets.append(code)
+    if target_codes:
+        seen = set()
+        for raw_code in target_codes:
+            try:
+                code = normalize_jp_listed_code(raw_code)
+            except OfficialDataError:
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            if force or code not in cached_codes:
+                targets.append(code)
+        print(f"JP cache: loaded {len(targets)} requested uncached targets", flush=True)
+    else:
+        print("JP cache: loading J-Quants listed info...", flush=True)
+        rows = client.get_listed_info()
+        print(f"JP cache: loaded {len(rows)} listed rows; preparing targets...", flush=True)
+        for row in rows:
+            raw_code = str(row.get("Code") or row.get("LocalCode") or "").strip()
+            try:
+                code = normalize_jp_listed_code(raw_code)
+            except OfficialDataError:
+                continue
+            if code and (force or code not in cached_codes):
+                targets.append(code)
     if limit is not None and limit > 0:
         targets = targets[:limit]
     print(f"JP cache: {len(targets)} uncached targets to process", flush=True)
@@ -5333,6 +5370,8 @@ if __name__ == "__main__":
     parser.add_argument("--jp-cache-limit", type=int, help="Limit JP cache build to N uncached symbols")
     parser.add_argument("--jp-cache-force", action="store_true", help="Rebuild JP cache from scratch")
     parser.add_argument("--jp-cache-include-price", action="store_true", help="Also fetch J-Quants daily quote during JP cache build")
+    parser.add_argument("--jp-cache-symbol", action="append", help="JP symbol/code to build; repeat for multiple symbols")
+    parser.add_argument("--jp-cache-symbols-file", help="Text or CSV file containing JP symbols/codes to build")
     parser.add_argument("--build-uk-cache", action="store_true", help="Build/update UK fundamentals cache from local official ESEF/iXBRL files")
     parser.add_argument("--uk-cache-output", default=str(UK_FUNDAMENTALS_CACHE_PATH), help="UK cache output JSONL path")
     parser.add_argument("--uk-cache-input", action="append", help="UK ESEF .zip/.xhtml/.xml file or directory; repeat for multiple companies")
@@ -5355,11 +5394,15 @@ if __name__ == "__main__":
         sys.exit(0 if written or total == 0 else 1)
 
     if args.build_jp_cache:
+        jp_target_codes = list(args.jp_cache_symbol or [])
+        if args.jp_cache_symbols_file:
+            jp_target_codes.extend(load_symbol_file(Path(args.jp_cache_symbols_file)))
         written, total, last_error = build_jp_fundamentals_cache(
             Path(args.jp_cache_output),
             limit=args.jp_cache_limit,
             force=args.jp_cache_force or args.force_cache_refresh,
             include_price=args.jp_cache_include_price,
+            target_codes=jp_target_codes or None,
         )
         print(f"JP cache complete: wrote {written}/{total} rows to {args.jp_cache_output}")
         if last_error:
