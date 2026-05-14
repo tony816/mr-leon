@@ -155,7 +155,24 @@ SHARES_TAGS = (
     "NumberOfSharesOutstanding",
     "WeightedAverageNumberOfOrdinarySharesOutstanding",
     "WeightedAverageNumberOfSharesOutstandingBasic",
+    "WeightedAverageNumberOfOrdinarySharesOutstandingBasic",
+    "WeightedAverageNumberOfOrdinarySharesForBasicEarningsPerShare",
     "IssuedCapitalNumberOfShares",
+    "NumberOfOrdinaryShares",
+    "NumberOfOrdinarySharesOutstanding",
+    "OrdinarySharesNumber",
+    "IssuedShares",
+    "SharesInIssue",
+    "NumberOfSharesInIssue",
+    "TotalNumberOfIssuedOrdinaryShares",
+    "WeightedAverageShares",
+    "AdjustedWeightedAverageShares",
+)
+EPS_TAGS = (
+    "BasicEarningsLossPerShare",
+    "BasicEarningsLossPerShareFromContinuingOperations",
+    "DilutedEarningsLossPerShare",
+    "DilutedEarningsLossPerShareFromContinuingOperations",
 )
 
 
@@ -744,6 +761,164 @@ def latest_fact(facts: Dict[str, List[Dict[str, Any]]], tags: Sequence[str], ann
     return max(candidates, key=lambda x: (x[0], x[1], x[2]))[3]
 
 
+def latest_fact_item(
+    facts: Dict[str, List[Dict[str, Any]]],
+    tags: Sequence[str],
+    annual: Optional[bool] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    candidates: List[Tuple[int, int, int, str, Dict[str, Any]]] = []
+    tag_rank = {tag: idx for idx, tag in enumerate(tags)}
+    for tag in tags:
+        for fact in facts.get(tag, []):
+            value = fact.get("value")
+            if value is None:
+                continue
+            duration = int(fact.get("duration_days") or 0)
+            if annual is True and duration and not (300 <= duration <= 400):
+                continue
+            if annual is False and duration > 10:
+                continue
+            candidates.append(
+                (
+                    int(fact.get("year") or 0),
+                    int(fact.get("end_ord") or 0),
+                    -tag_rank[tag],
+                    tag,
+                    fact,
+                )
+            )
+    if not candidates:
+        return None
+    _, _, _, tag, fact = max(candidates, key=lambda x: (x[0], x[1], x[2]))
+    return tag, fact
+
+
+def unit_currency(unit: Any) -> str:
+    text = str(unit or "").upper()
+    for part in re.split(r"[,/ ]+", text):
+        if part in {"GBP", "USD", "EUR"}:
+            return part
+    return ""
+
+
+def fact_currency(facts: Dict[str, List[Dict[str, Any]]], tags: Sequence[str]) -> str:
+    item = latest_fact_item(facts, tags, annual=False)
+    if not item:
+        item = latest_fact_item(facts, tags, annual=True)
+    if not item:
+        return ""
+    return unit_currency(item[1].get("unit"))
+
+
+def latest_share_count(facts: Dict[str, List[Dict[str, Any]]]) -> Tuple[Optional[float], str]:
+    direct = latest_fact(facts, SHARES_TAGS, annual=None)
+    if direct is not None and direct > 0:
+        return direct, "tag"
+
+    pattern_candidates: List[Tuple[int, int, int, float, str]] = []
+    for tag, items in facts.items():
+        lower = tag.lower()
+        if "share" not in lower:
+            continue
+        looks_like_count = (
+            ("weighted" in lower and "average" in lower)
+            or "sharesoutstanding" in lower
+            or "sharesinissue" in lower
+            or "numberofshares" in lower
+            or "numberofordinaryshares" in lower
+            or lower in {"issuedshares", "ordinarysharesnumber"}
+        )
+        if not looks_like_count:
+            continue
+        if any(token in lower for token in ("pershare", "sharebased", "treasury", "dividend", "premium", "reserve")):
+            continue
+        for fact in items:
+            unit_parts = [p for p in re.split(r"[,/ ]+", str(fact.get("unit") or "").lower()) if p]
+            if unit_parts and unit_parts != ["shares"]:
+                continue
+            value = fact.get("value")
+            if value is None or value <= 0:
+                continue
+            pattern_candidates.append(
+                (
+                    int(fact.get("year") or 0),
+                    int(fact.get("end_ord") or 0),
+                    int(fact.get("source_rank") or 0),
+                    float(value),
+                    tag,
+                )
+            )
+    if pattern_candidates:
+        best = max(pattern_candidates, key=lambda x: (x[0], x[1], x[2]))
+        return best[3], f"tag:{best[4]}"
+
+    inferred = infer_share_count_from_eps(facts)
+    if inferred is not None:
+        return inferred, "eps_inferred"
+    return None, ""
+
+
+def infer_share_count_from_eps(facts: Dict[str, List[Dict[str, Any]]]) -> Optional[float]:
+    profit_item = latest_fact_item(facts, ("ProfitLossAttributableToOwnersOfParent",), annual=True)
+    if not profit_item:
+        profit_item = latest_fact_item(facts, ("ProfitLossFromContinuingOperations",), annual=True)
+    if not profit_item:
+        profit_item = latest_fact_item(facts, ("ProfitLoss",), annual=True)
+    if not profit_item:
+        return None
+
+    profit_fact = profit_item[1]
+    profit = profit_fact.get("value")
+    year = int(profit_fact.get("year") or 0)
+    if profit in (None, 0) or not year:
+        return None
+
+    eps_candidates: List[Tuple[int, int, int, float, str]] = []
+    tag_rank = {tag: idx for idx, tag in enumerate(EPS_TAGS)}
+    for tag in EPS_TAGS:
+        for fact in facts.get(tag, []):
+            value = fact.get("value")
+            if value in (None, 0):
+                continue
+            if int(fact.get("year") or 0) != year:
+                continue
+            duration = int(fact.get("duration_days") or 0)
+            if duration and not (300 <= duration <= 400):
+                continue
+            unit = str(fact.get("unit") or "").lower()
+            if "shares" not in unit:
+                continue
+            eps = float(value)
+            if abs(eps) > 10_000:
+                continue
+            eps_candidates.append(
+                (
+                    -tag_rank[tag],
+                    int(fact.get("end_ord") or 0),
+                    -abs(eps),
+                    eps,
+                    tag,
+                )
+            )
+    if not eps_candidates:
+        return None
+
+    estimates: List[float] = []
+    for _, _, _, eps, _tag in eps_candidates:
+        scaled_eps = eps / 100 if abs(eps) > 50 else eps
+        estimate = float(profit) / scaled_eps if scaled_eps else 0.0
+        if estimate <= 0:
+            continue
+        if estimate < 10_000_000 and abs(eps) > 1:
+            estimate = float(profit) / (eps / 100)
+        if 100_000 <= estimate <= 100_000_000_000:
+            estimates.append(estimate)
+    if not estimates:
+        return None
+    estimates.sort()
+    return estimates[len(estimates) // 2]
+
+
 def fact_series(facts: Dict[str, List[Dict[str, Any]]], tags: Sequence[str]) -> Dict[int, float]:
     series: Dict[int, Tuple[int, int, int, float]] = {}
     tag_rank = {tag: idx for idx, tag in enumerate(tags)}
@@ -864,7 +1039,8 @@ def build_cache_record(ticker: str, name: str, facts: Dict[str, List[Dict[str, A
     equity = latest_fact(facts, EQUITY_TAGS, annual=False)
     liabilities = latest_fact(facts, LIABILITIES_TAGS, annual=False)
     debt = choose_debt(facts)
-    shares = latest_fact(facts, SHARES_TAGS, annual=False)
+    shares, shares_source = latest_share_count(facts)
+    report_currency = fact_currency(facts, CASH_TAGS) or fact_currency(facts, EQUITY_TAGS)
 
     net_cash, debt_used = compute_net_cash(cash, debt)
     liabilities_ratio = (liabilities / equity * 100) if liabilities is not None and equity not in (None, 0) else None
@@ -917,6 +1093,10 @@ def build_cache_record(ticker: str, name: str, facts: Dict[str, List[Dict[str, A
         "liquid_funds": cash,
         "interest_bearing_debt": debt_used,
         "net_cash": net_cash,
+        "net_income": net_income,
+        "shares": shares,
+        "shares_source": shares_source,
+        "report_currency": report_currency,
         "quote_source": "yahoo",
         "fundamentals_source": "official-esef",
         "source_file": ";".join(source_files[:20]),

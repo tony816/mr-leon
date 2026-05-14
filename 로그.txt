@@ -1,0 +1,530 @@
+PS C:\WINDOWS\system32> cd C:\mr-leon
+>>
+>> cmd /c "python collect_uk_ch_and_build_cache.py --source ch --universe-csv ""C:\Users\tony960816\OneDrive - 특허법인 무한\SP\mr-leon-uk-cache\uk_ch_backfill_universe.csv"" --work-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache"" --download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\bulk_zips"" --extract-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\extracted_accounts"" --builder-download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_filings"" --include-monthly --skip-download --delete-bulk-zip-after-extract --build-cache --rebuild-existing --allow-missing-ticker"
+>>
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 60
+  2021-01-01 [monthly] Accounts_Monthly_Data-January2021.zip
+  2021-02-01 [monthly] Accounts_Monthly_Data-February2021.zip
+  2021-03-01 [monthly] Accounts_Monthly_Data-March2021.zip
+  2021-04-01 [monthly] Accounts_Monthly_Data-April2021.zip
+  2021-05-01 [monthly] Accounts_Monthly_Data-May2021.zip
+  2021-06-01 [monthly] Accounts_Monthly_Data-June2021.zip
+  2021-07-01 [monthly] Accounts_Monthly_Data-July2021.zip
+  2021-08-01 [monthly] Accounts_Monthly_Data-August2021.zip
+  2021-09-01 [monthly] Accounts_Monthly_Data-September2021.zip
+  2021-10-01 [monthly] Accounts_Monthly_Data-October2021.zip
+  2021-11-01 [monthly] Accounts_Monthly_Data-November2021.zip
+  2021-12-01 [monthly] Accounts_Monthly_Data-December2021.zip
+  2022-01-01 [monthly] Accounts_Monthly_Data-January2022.zip
+  2022-02-01 [monthly] Accounts_Monthly_Data-February2022.zip
+  2022-03-01 [monthly] Accounts_Monthly_Data-March2022.zip
+  2022-04-01 [monthly] Accounts_Monthly_Data-April2022.zip
+  2022-05-01 [monthly] Accounts_Monthly_Data-May2022.zip
+  2022-06-01 [monthly] Accounts_Monthly_Data-June2022.zip
+  2022-07-01 [monthly] Accounts_Monthly_Data-July2022.zip
+  2022-08-01 [monthly] Accounts_Monthly_Data-August2022.zip
+  ... +40 more
+Using existing downloaded ZIPs: 11
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-April2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-August2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-February2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-January2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-July2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-June2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-March2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-May2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-November2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-October2021.zip
+Deleted bulk ZIP after extract: Accounts_Monthly_Data-September2021.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+PS C:\mr-leon> cd C:\mr-leon
+>>
+>> cmd /c "python collect_uk_ch_and_build_cache.py --source ch --universe-csv ""C:\Users\tony960816\OneDrive - 특허법인 무한\SP\mr-leon-uk-cache\uk_ch_backfill_universe.csv"" --work-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache"" --download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\bulk_zips"" --extract-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\extracted_accounts"" --builder-download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_filings"" --include-monthly --from-date 2021-12-01 --to-date 2021-12-31 --delete-bulk-zip-after-extract --build-cache --rebuild-existing --allow-missing-ticker"
+>>
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2021-12-01 [monthly] Accounts_Monthly_Data-December2021.zip
+[1/1] Downloading Accounts_Monthly_Data-December2021.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-December2021.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+PS C:\mr-leon> cd C:\mr-leon
+>>
+>> $months = 1..12
+>> foreach ($m in $months) {
+>>   $from = Get-Date -Year 2022 -Month $m -Day 1
+>>   $to = $from.AddMonths(1).AddDays(-1)
+>>   $fromText = $from.ToString("yyyy-MM-dd")
+>>   $toText = $to.ToString("yyyy-MM-dd")
+>>
+>>   cmd /c "python collect_uk_ch_and_build_cache.py --source ch --universe-csv ""C:\Users\tony960816\OneDrive - 특허법 인무한\SP\mr-leon-uk-cache\uk_ch_backfill_universe.csv"" --work-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache"" --download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\bulk_zips"" --extract-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\extracted_accounts"" --builder-download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_filings"" --include-monthly --from-date $fromText --to-date $toText --delete-bulk-zip-after-extract --build-cache --rebuild-existing --allow-missing-ticker"
+>> }
+>>
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-01-01 [monthly] Accounts_Monthly_Data-January2022.zip
+[1/1] Downloading Accounts_Monthly_Data-January2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-January2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-02-01 [monthly] Accounts_Monthly_Data-February2022.zip
+[1/1] Downloading Accounts_Monthly_Data-February2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-February2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-03-01 [monthly] Accounts_Monthly_Data-March2022.zip
+[1/1] Downloading Accounts_Monthly_Data-March2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-March2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-04-01 [monthly] Accounts_Monthly_Data-April2022.zip
+[1/1] Downloading Accounts_Monthly_Data-April2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-April2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-05-01 [monthly] Accounts_Monthly_Data-May2022.zip
+[1/1] Downloading Accounts_Monthly_Data-May2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-May2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-06-01 [monthly] Accounts_Monthly_Data-June2022.zip
+[1/1] Downloading Accounts_Monthly_Data-June2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-June2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-07-01 [monthly] Accounts_Monthly_Data-July2022.zip
+[1/1] Downloading Accounts_Monthly_Data-July2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-July2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-08-01 [monthly] Accounts_Monthly_Data-August2022.zip
+[1/1] Downloading Accounts_Monthly_Data-August2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-August2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-09-01 [monthly] Accounts_Monthly_Data-September2022.zip
+[1/1] Downloading Accounts_Monthly_Data-September2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-September2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-10-01 [monthly] Accounts_Monthly_Data-October2022.zip
+[1/1] Downloading Accounts_Monthly_Data-October2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-October2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-11-01 [monthly] Accounts_Monthly_Data-November2022.zip
+[1/1] Downloading Accounts_Monthly_Data-November2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-November2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2022-12-01 [monthly] Accounts_Monthly_Data-December2022.zip
+[1/1] Downloading Accounts_Monthly_Data-December2022.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-December2022.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+PS C:\mr-leon> $months = 1..12
+>> foreach ($m in $months) {
+>>   $from = Get-Date -Year 2023 -Month $m -Day 1
+>>   $to = $from.AddMonths(1).AddDays(-1)
+>>   $fromText = $from.ToString("yyyy-MM-dd")
+>>   $toText = $to.ToString("yyyy-MM-dd")
+>>
+>>   cmd /c "python collect_uk_ch_and_build_cache.py --source ch --universe-csv ""C:\Users\tony960816\OneDrive - 특허법 인무한\SP\mr-leon-uk-cache\uk_ch_backfill_universe.csv"" --work-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache"" --download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\bulk_zips"" --extract-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\extracted_accounts"" --builder-download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_filings"" --include-monthly --from-date $fromText --to-date $toText --delete-bulk-zip-after-extract --build-cache --rebuild-existing --allow-missing-ticker"
+>> }
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-01-01 [monthly] Accounts_Monthly_Data-January2023.zip
+[1/1] Downloading Accounts_Monthly_Data-January2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-January2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-02-01 [monthly] Accounts_Monthly_Data-February2023.zip
+[1/1] Downloading Accounts_Monthly_Data-February2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-February2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-03-01 [monthly] Accounts_Monthly_Data-March2023.zip
+[1/1] Downloading Accounts_Monthly_Data-March2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-March2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-04-01 [monthly] Accounts_Monthly_Data-April2023.zip
+[1/1] Downloading Accounts_Monthly_Data-April2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-April2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-05-01 [monthly] Accounts_Monthly_Data-May2023.zip
+[1/1] Downloading Accounts_Monthly_Data-May2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-May2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-06-01 [monthly] Accounts_Monthly_Data-June2023.zip
+[1/1] Downloading Accounts_Monthly_Data-June2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-June2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-07-01 [monthly] Accounts_Monthly_Data-July2023.zip
+[1/1] Downloading Accounts_Monthly_Data-July2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-July2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-08-01 [monthly] Accounts_Monthly_Data-August2023.zip
+[1/1] Downloading Accounts_Monthly_Data-August2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-August2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-09-01 [monthly] Accounts_Monthly_Data-September2023.zip
+[1/1] Downloading Accounts_Monthly_Data-September2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-September2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-10-01 [monthly] Accounts_Monthly_Data-October2023.zip
+[1/1] Downloading Accounts_Monthly_Data-October2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-October2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-11-01 [monthly] Accounts_Monthly_Data-November2023.zip
+[1/1] Downloading Accounts_Monthly_Data-November2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-November2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2023-12-01 [monthly] Accounts_Monthly_Data-December2023.zip
+[1/1] Downloading Accounts_Monthly_Data-December2023.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-December2023.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+PS C:\mr-leon> $months = 1..12
+>> foreach ($m in $months) {
+>>   $from = Get-Date -Year 2024 -Month $m -Day 1
+>>   $to = $from.AddMonths(1).AddDays(-1)
+>>   $fromText = $from.ToString("yyyy-MM-dd")
+>>   $toText = $to.ToString("yyyy-MM-dd")
+>>
+>>   cmd /c "python collect_uk_ch_and_build_cache.py --source ch --universe-csv ""C:\Users\tony960816\OneDrive - 특허법 인무한\SP\mr-leon-uk-cache\uk_ch_backfill_universe.csv"" --work-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache"" --download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\bulk_zips"" --extract-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\extracted_accounts"" --builder-download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_filings"" --include-monthly --from-date $fromText --to-date $toText --delete-bulk-zip-after-extract --build-cache --rebuild-existing --allow-missing-ticker"
+>> }
+>>
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-01-01 [monthly] Accounts_Monthly_Data-January2024.zip
+[1/1] Downloading Accounts_Monthly_Data-January2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-January2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-02-01 [monthly] Accounts_Monthly_Data-February2024.zip
+[1/1] Downloading Accounts_Monthly_Data-February2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-February2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-03-01 [monthly] Accounts_Monthly_Data-March2024.zip
+[1/1] Downloading Accounts_Monthly_Data-March2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-March2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-04-01 [monthly] Accounts_Monthly_Data-April2024.zip
+[1/1] Downloading Accounts_Monthly_Data-April2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-April2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-05-01 [monthly] Accounts_Monthly_Data-May2024.zip
+[1/1] Downloading Accounts_Monthly_Data-May2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-May2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-06-01 [monthly] Accounts_Monthly_Data-June2024.zip
+[1/1] Downloading Accounts_Monthly_Data-June2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-June2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-07-01 [monthly] Accounts_Monthly_Data-July2024.zip
+[1/1] Downloading Accounts_Monthly_Data-July2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-July2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-08-01 [monthly] Accounts_Monthly_Data-August2024.zip
+[1/1] Downloading Accounts_Monthly_Data-August2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-August2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-09-01 [monthly] Accounts_Monthly_Data-September2024.zip
+[1/1] Downloading Accounts_Monthly_Data-September2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-September2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-10-01 [monthly] Accounts_Monthly_Data-October2024.zip
+[1/1] Downloading Accounts_Monthly_Data-October2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-October2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-11-01 [monthly] Accounts_Monthly_Data-November2024.zip
+[1/1] Downloading Accounts_Monthly_Data-November2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-November2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2024-12-01 [monthly] Accounts_Monthly_Data-December2024.zip
+[1/1] Downloading Accounts_Monthly_Data-December2024.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-December2024.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+PS C:\mr-leon> $months = 1..12
+>> foreach ($m in $months) {
+>>   $from = Get-Date -Year 2025 -Month $m -Day 1
+>>   $to = $from.AddMonths(1).AddDays(-1)
+>>   $fromText = $from.ToString("yyyy-MM-dd")
+>>   $toText = $to.ToString("yyyy-MM-dd")
+>>
+>>   cmd /c "python collect_uk_ch_and_build_cache.py --source ch --universe-csv ""C:\Users\tony960816\OneDrive - 특허법 인무한\SP\mr-leon-uk-cache\uk_ch_backfill_universe.csv"" --work-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache"" --download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\bulk_zips"" --extract-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\extracted_accounts"" --builder-download-dir ""C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_filings"" --include-monthly --from-date $fromText --to-date $toText --delete-bulk-zip-after-extract --build-cache --rebuild-existing --allow-missing-ticker"
+>> }
+>>
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-01-01 [monthly] Accounts_Monthly_Data-January2025.zip
+[1/1] Downloading Accounts_Monthly_Data-January2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-January2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-02-01 [monthly] Accounts_Monthly_Data-February2025.zip
+[1/1] Downloading Accounts_Monthly_Data-February2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-February2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-03-01 [monthly] Accounts_Monthly_Data-March2025.zip
+[1/1] Downloading Accounts_Monthly_Data-March2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-March2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-04-01 [monthly] Accounts_Monthly_Data-April2025.zip
+[1/1] Downloading Accounts_Monthly_Data-April2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-April2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-05-01 [monthly] Accounts_Monthly_Data-May2025.zip
+[1/1] Downloading Accounts_Monthly_Data-May2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-May2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-06-01 [monthly] Accounts_Monthly_Data-June2025.zip
+[1/1] Downloading Accounts_Monthly_Data-June2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-June2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-07-01 [monthly] Accounts_Monthly_Data-July2025.zip
+[1/1] Downloading Accounts_Monthly_Data-July2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-July2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-08-01 [monthly] Accounts_Monthly_Data-August2025.zip
+[1/1] Downloading Accounts_Monthly_Data-August2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-August2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-09-01 [monthly] Accounts_Monthly_Data-September2025.zip
+[1/1] Downloading Accounts_Monthly_Data-September2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-September2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-10-01 [monthly] Accounts_Monthly_Data-October2025.zip
+[1/1] Downloading Accounts_Monthly_Data-October2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-October2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-11-01 [monthly] Accounts_Monthly_Data-November2025.zip
+[1/1] Downloading Accounts_Monthly_Data-November2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-November2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+Universe companies: 730
+Discovering Companies House bulk ZIP links...
+Bulk ZIP candidates: 1
+  2025-12-01 [monthly] Accounts_Monthly_Data-December2025.zip
+[1/1] Downloading Accounts_Monthly_Data-December2025.zip
+  deleted bulk ZIP after extract: Accounts_Monthly_Data-December2025.zip
+Extracted account files: 0
+Manifest: C:\Users\tony960816\OneDrive - 특허법인무한\SP\mr-leon-uk-cache\uk_ch_manifest.csv
+No extracted accounts; builder not run.
+PS C:\mr-leon>

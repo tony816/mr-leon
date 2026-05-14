@@ -1961,6 +1961,8 @@ def normalize_jp_code(user_text: str) -> str:
     code = re.sub(r"[^0-9A-Z]", "", code)
     if not re.fullmatch(r"[0-9A-Z]{4,5}", code):
         raise OfficialDataError("Enter a 4- or 5-character Japanese stock code, e.g. 7203, 130A, or 25935.")
+    if len(code) == 5 and code.endswith("0"):
+        return code[:4]
     return code
 
 
@@ -2183,6 +2185,7 @@ def fetch_jquants_financials_with_client(
         "summary": {
             "sales": format_amount(revenue) if revenue is not None else "N/A",
             "op_income": format_amount(op_income) if op_income is not None else "N/A",
+            "net_income": format_amount(net_income) if net_income is not None else "N/A",
             "equity": format_amount(equity) if equity is not None else "N/A",
             "매출액": format_amount(revenue) if revenue is not None else "N/A",
             "영업이익": format_amount(op_income) if op_income is not None else "N/A",
@@ -2197,6 +2200,10 @@ def fetch_jquants_financials_with_client(
         "sales_growth_5y_avg_pct": sales_avg,
         "op_growth_5y_avg_pct": op_avg,
         "net_income_growth_5y_avg_pct": net_avg,
+        "net_income": net_income,
+        "eps": eps,
+        "bps": bps,
+        "price_value": price_val,
         "liquid_funds_total": cash_val,
         "interest_bearing_debt": debt_used,
         "interest_bearing_debt_source": debt_source,
@@ -2253,13 +2260,17 @@ def build_jquants_listing_only_cache_record(
         "corp_name": str(name),
         "corp_code": code,
         "bsns_year": "-",
-        "summary": {"sales": "N/A", "op_income": "N/A", "equity": "N/A"},
+        "summary": {"sales": "N/A", "op_income": "N/A", "net_income": "N/A", "equity": "N/A"},
         "sales_growth_5y": "N/A",
         "op_growth_5y": "N/A",
         "net_income_growth_5y": "N/A",
         "sales_growth_5y_avg_pct": None,
         "op_growth_5y_avg_pct": None,
         "net_income_growth_5y_avg_pct": None,
+        "net_income": None,
+        "eps": None,
+        "bps": None,
+        "price_value": price_val,
         "liquid_funds_total": None,
         "liquid_funds_source_date": None,
         "interest_bearing_debt": None,
@@ -2600,6 +2611,7 @@ def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[s
     }
     record["sales"] = summary.get("sales") or record.get("sales", "N/A")
     record["op_income"] = summary.get("op_income") or record.get("op_income", "N/A")
+    record["net_income"] = detail.get("net_income")
     record["equity"] = summary.get("equity") or record.get("equity", "N/A")
     record["liquid_funds"] = detail.get("liquid_funds_total")
     record["liquid_funds_source_date"] = detail.get("liquid_funds_source_date")
@@ -2612,6 +2624,9 @@ def detail_to_cache_record(country: str, snapshot: PriceSnapshot, detail: Dict[s
         "fundamentals_error",
         "quote_status",
         "currency",
+        "eps",
+        "bps",
+        "price_value",
     ):
         if optional_key in detail:
             record[optional_key] = detail.get(optional_key)
@@ -2817,16 +2832,21 @@ def cache_record_can_pass_static_filters(
         return False
 
     if ncsr_min is not None and ncsr_min > 0:
-        net_cash_ps = parse_float(record.get("net_cash_per_share_value"))
-        if net_cash_ps is None:
-            net_cash_ps = parse_float(record.get("net_cash_per_share"))
-        net_cash = parse_float(record.get("net_cash"))
-        if net_cash_ps is None and net_cash is None:
-            return False
-        if net_cash_ps is not None and net_cash_ps <= 0:
-            return False
-        if net_cash_ps is None and net_cash is not None and net_cash <= 0:
-            return False
+        ncsr_ratio = parse_float(record.get("net_cash_per_share_ratio"))
+        if ncsr_ratio is not None:
+            if ncsr_ratio <= 0:
+                return False
+        else:
+            net_cash_ps = parse_float(record.get("net_cash_per_share_value"))
+            if net_cash_ps is None:
+                net_cash_ps = parse_float(record.get("net_cash_per_share"))
+            net_cash = parse_float(record.get("net_cash"))
+            if net_cash_ps is None and net_cash is None:
+                return False
+            if net_cash_ps is not None and net_cash_ps <= 0:
+                return False
+            if net_cash_ps is None and net_cash is not None and net_cash <= 0:
+                return False
 
     def growth_can_pass(delta_min: Optional[float], growth_key: str) -> bool:
         if delta_min is None:
@@ -2841,6 +2861,28 @@ def cache_record_can_pass_static_filters(
         and growth_can_pass(op_delta_min, "op_growth_5y_avg_pct")
         and growth_can_pass(net_delta_min, "net_income_growth_5y_avg_pct")
     )
+
+
+def cache_record_needs_quote_for_filters(
+    record: Dict[str, Any],
+    per_min: Optional[float],
+    per_max: Optional[float],
+    pbr_min: Optional[float],
+    pbr_max: Optional[float],
+    ncsr_min: Optional[float],
+    ncsr_max: Optional[float],
+    sales_delta_min: Optional[float],
+    op_delta_min: Optional[float],
+    net_delta_min: Optional[float],
+) -> bool:
+    needs_per = any(value is not None for value in (per_min, per_max, sales_delta_min, op_delta_min, net_delta_min))
+    if needs_per and parse_float(record.get("per")) is None:
+        return True
+    if (pbr_min is not None or pbr_max is not None) and parse_float(record.get("pbr")) is None:
+        return True
+    if (ncsr_min is not None or ncsr_max is not None) and parse_float(record.get("net_cash_per_share_ratio")) is None:
+        return True
+    return False
 
 
 def scan_cached_fundamentals_records(
@@ -2865,7 +2907,7 @@ def scan_cached_fundamentals_records(
 ) -> Tuple[List[Tuple[Any, ...]], int, Optional[str]]:
     original_total = len(records)
     quote_candidates = records
-    if country == "KR":
+    if country in ("KR", "JP"):
         quote_candidates = [
             record
             for record in records
@@ -2882,15 +2924,40 @@ def scan_cached_fundamentals_records(
             )
         ]
         if progress_cb:
-            progress_cb(f"KR cache prefilter... {len(quote_candidates)}/{original_total} quote candidates")
+            progress_cb(f"{country} cache prefilter... {len(quote_candidates)}/{original_total} quote candidates")
+
+    quote_needed = [
+        record
+        for record in quote_candidates
+        if cache_record_needs_quote_for_filters(
+            record,
+            per_min,
+            per_max,
+            pbr_min,
+            pbr_max,
+            ncsr_min,
+            ncsr_max,
+            sales_delta_min,
+            op_delta_min,
+            net_delta_min,
+        )
+    ]
+    quote_needed_ids = {id(record) for record in quote_needed}
+    quote_not_needed = [record for record in quote_candidates if id(record) not in quote_needed_ids]
 
     try:
-        enriched = enrich_cache_records_with_yahoo(
-            quote_candidates,
-            country,
-            quote_fetcher=quote_fetcher,
-            progress_cb=progress_cb,
-        )
+        enriched = [dict(record) for record in quote_not_needed]
+        if quote_needed:
+            enriched.extend(
+                enrich_cache_records_with_yahoo(
+                    quote_needed,
+                    country,
+                    quote_fetcher=quote_fetcher,
+                    progress_cb=progress_cb,
+                )
+            )
+        elif progress_cb:
+            progress_cb(f"{country} cache scan uses cached quote metrics")
     except Exception as exc:
         return [], original_total, str(exc)
 
@@ -2927,18 +2994,53 @@ def quote_has_usable_values(quote: Optional[Dict[str, Any]]) -> bool:
     return any(quote.get(key) is not None for key in ("price", "per", "pbr", "market_cap"))
 
 
+def quote_price_major_unit(price: Optional[float], currency: Any) -> Optional[float]:
+    if price is None:
+        return None
+    try:
+        price_val = float(price)
+    except Exception:
+        return None
+    currency_text = str(currency or "").strip()
+    if currency_text in ("GBp", "GBX"):
+        return price_val / 100
+    return price_val
+
+
 def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str, Any]]) -> None:
     price = quote.get("price") if quote else None
     per_val = quote.get("per") if quote else None
     pbr_val = quote.get("pbr") if quote else None
+    quote_currency = quote.get("currency") if quote else None
+    price_major = quote_price_major_unit(price, quote_currency)
     shares = parse_float(record.get("shares"))
     if shares is None:
         shares = parse_float(record.get("float_shares"))
     net_income = parse_float(record.get("net_income"))
     equity = parse_float(record.get("equity"))
+    eps = parse_float(record.get("eps"))
+    bps = parse_float(record.get("bps"))
     market_cap = quote.get("market_cap") if quote else None
     if market_cap is None:
-        market_cap = float(price) * shares if price is not None and shares else None
+        market_cap = price_major * shares if price_major is not None and shares else None
+    if shares is None and market_cap not in (None, 0) and price_major not in (None, 0):
+        try:
+            shares = float(market_cap) / float(price_major)
+            record["shares"] = shares
+            record["shares_source"] = "quote_market_cap"
+        except Exception:
+            shares = None
+
+    if per_val is None and price_major is not None and eps not in (None, 0):
+        try:
+            per_val = price_major / eps
+        except Exception:
+            per_val = None
+    if pbr_val is None and price_major is not None and bps not in (None, 0):
+        try:
+            pbr_val = price_major / bps
+        except Exception:
+            pbr_val = None
 
     if per_val is None and market_cap is not None and net_income not in (None, 0):
         try:
@@ -2961,9 +3063,18 @@ def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str
     net_cash_ps = parse_float(record.get("net_cash_per_share_value"))
     if net_cash_ps is None:
         net_cash_ps = parse_float(record.get("net_cash_per_share"))
-    if net_cash_ps is not None and price not in (None, 0):
+    if net_cash_ps is None and shares not in (None, 0):
+        net_cash = parse_float(record.get("net_cash"))
+        if net_cash is not None:
+            try:
+                net_cash_ps = net_cash / float(shares)
+                record["net_cash_per_share_value"] = net_cash_ps
+                record["net_cash_per_share"] = f"{net_cash_ps:,.2f}"
+            except Exception:
+                net_cash_ps = None
+    if net_cash_ps is not None and price_major not in (None, 0):
         try:
-            record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price)) * 100:,.2f}%"
+            record["net_cash_per_share_ratio"] = f"{(net_cash_ps / float(price_major)) * 100:,.2f}%"
         except Exception:
             pass
     elif market_cap not in (None, 0):
@@ -2985,13 +3096,16 @@ def enrich_jp_cache_records_with_yahoo(
     enriched = [dict(record) for record in records]
     code_to_record = {str(record.get("code") or "").strip(): record for record in enriched}
     symbols = [f"{code}.T" for code in code_to_record if code]
+    applied_count = 0
+    last_error = None
     for offset in range(0, len(symbols), 100):
         chunk = symbols[offset : offset + 100]
         if progress_cb:
             progress_cb(f"JP quotes... {offset}/{len(symbols)}")
         try:
             quotes = quote_fetcher(chunk)
-        except Exception:
+        except Exception as exc:
+            last_error = str(exc)
             quotes = {}
         for symbol in chunk:
             code = symbol.split(".", 1)[0]
@@ -3000,6 +3114,9 @@ def enrich_jp_cache_records_with_yahoo(
             if not record or not quote:
                 continue
             apply_quote_to_cache_record(record, quote)
+            applied_count += 1
+    if symbols and applied_count == 0 and last_error:
+        raise EdgarError(f"JP quote enrichment failed: {last_error}")
     return enriched
 
 
@@ -3215,6 +3332,142 @@ def _fact_latest(facts: Dict[str, List[Dict[str, Any]]], names: Tuple[str, ...])
     return max(candidates, key=lambda c: (c[0], c[1]))[2]
 
 
+def _fact_latest_item(
+    facts: Dict[str, List[Dict[str, Any]]],
+    names: Tuple[str, ...],
+    annual: Optional[bool] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    candidates: List[Tuple[int, int, int, str, Dict[str, Any]]] = []
+    tag_rank = {name: idx for idx, name in enumerate(names)}
+    for name in names:
+        for fact in facts.get(name, []):
+            if fact.get("value") is None:
+                continue
+            duration = int(fact.get("duration_days") or 0)
+            if annual is True and duration and not (300 <= duration <= 400):
+                continue
+            if annual is False and duration > 10:
+                continue
+            candidates.append(
+                (
+                    int(fact.get("year") or 0),
+                    int(fact.get("end_ord") or _parse_iso_date(fact.get("end") or "")),
+                    -tag_rank[name],
+                    name,
+                    fact,
+                )
+            )
+    if not candidates:
+        return None
+    _, _, _, name, fact = max(candidates, key=lambda c: (c[0], c[1], c[2]))
+    return name, fact
+
+
+def _unit_currency(unit: Any) -> str:
+    for part in re.split(r"[,/ ]+", str(unit or "").upper()):
+        if part in {"GBP", "USD", "EUR"}:
+            return part
+    return ""
+
+
+def _uk_fact_currency(facts: Dict[str, List[Dict[str, Any]]], names: Tuple[str, ...]) -> str:
+    item = _fact_latest_item(facts, names, annual=False) or _fact_latest_item(facts, names, annual=True)
+    return _unit_currency(item[1].get("unit")) if item else ""
+
+
+def _uk_latest_share_count(facts: Dict[str, List[Dict[str, Any]]]) -> Tuple[Optional[float], str]:
+    direct = _fact_latest(facts, UK_SHARES_TAGS)
+    if direct is not None and direct > 0:
+        return direct, "tag"
+
+    pattern_candidates: List[Tuple[int, int, int, float, str]] = []
+    for tag, items in facts.items():
+        lower = tag.lower()
+        if "share" not in lower:
+            continue
+        looks_like_count = (
+            ("weighted" in lower and "average" in lower)
+            or "sharesoutstanding" in lower
+            or "sharesinissue" in lower
+            or "numberofshares" in lower
+            or "numberofordinaryshares" in lower
+            or lower in {"issuedshares", "ordinarysharesnumber"}
+        )
+        if not looks_like_count:
+            continue
+        if any(token in lower for token in ("pershare", "sharebased", "treasury", "dividend", "premium", "reserve")):
+            continue
+        for fact in items:
+            unit_parts = [p for p in re.split(r"[,/ ]+", str(fact.get("unit") or "").lower()) if p]
+            if unit_parts and unit_parts != ["shares"]:
+                continue
+            value = fact.get("value")
+            if value is None or value <= 0:
+                continue
+            pattern_candidates.append(
+                (
+                    int(fact.get("year") or 0),
+                    int(fact.get("end_ord") or _parse_iso_date(fact.get("end") or "")),
+                    int(fact.get("source_rank") or 0),
+                    float(value),
+                    tag,
+                )
+            )
+    if pattern_candidates:
+        best = max(pattern_candidates, key=lambda c: (c[0], c[1], c[2]))
+        return best[3], f"tag:{best[4]}"
+
+    inferred = _uk_infer_share_count_from_eps(facts)
+    if inferred is not None:
+        return inferred, "eps_inferred"
+    return None, ""
+
+
+def _uk_infer_share_count_from_eps(facts: Dict[str, List[Dict[str, Any]]]) -> Optional[float]:
+    profit_item = _fact_latest_item(facts, ("ProfitLossAttributableToOwnersOfParent",), annual=True)
+    if not profit_item:
+        profit_item = _fact_latest_item(facts, ("ProfitLossFromContinuingOperations",), annual=True)
+    if not profit_item:
+        profit_item = _fact_latest_item(facts, ("ProfitLoss",), annual=True)
+    if not profit_item:
+        return None
+
+    profit_fact = profit_item[1]
+    profit = profit_fact.get("value")
+    year = int(profit_fact.get("year") or 0)
+    if profit in (None, 0) or not year:
+        return None
+
+    estimates: List[float] = []
+    for tag in UK_EPS_TAGS:
+        for fact in facts.get(tag, []):
+            eps = fact.get("value")
+            if eps in (None, 0):
+                continue
+            if int(fact.get("year") or 0) != year:
+                continue
+            duration = int(fact.get("duration_days") or 0)
+            if duration and not (300 <= duration <= 400):
+                continue
+            if "shares" not in str(fact.get("unit") or "").lower():
+                continue
+            eps_val = float(eps)
+            if abs(eps_val) > 10_000:
+                continue
+            scaled_eps = eps_val / 100 if abs(eps_val) > 50 else eps_val
+            estimate = float(profit) / scaled_eps if scaled_eps else 0.0
+            if estimate <= 0:
+                continue
+            if estimate < 10_000_000 and abs(eps_val) > 1:
+                estimate = float(profit) / (eps_val / 100)
+            if 100_000 <= estimate <= 100_000_000_000:
+                estimates.append(estimate)
+    if not estimates:
+        return None
+    estimates.sort()
+    return estimates[len(estimates) // 2]
+
+
 def _fact_series(facts: Dict[str, List[Dict[str, Any]]], names: Tuple[str, ...]) -> Dict[int, float]:
     series: Dict[int, Tuple[int, float]] = {}
     for name in names:
@@ -3257,7 +3510,29 @@ UK_DEBT_TAGS = (
     "CurrentLeaseLiabilities",
     "NoncurrentLeaseLiabilities",
 )
-UK_SHARES_TAGS = ("NumberOfSharesOutstanding", "WeightedAverageNumberOfOrdinarySharesOutstanding")
+UK_SHARES_TAGS = (
+    "NumberOfSharesOutstanding",
+    "WeightedAverageNumberOfOrdinarySharesOutstanding",
+    "WeightedAverageNumberOfSharesOutstandingBasic",
+    "WeightedAverageNumberOfOrdinarySharesOutstandingBasic",
+    "WeightedAverageNumberOfOrdinarySharesForBasicEarningsPerShare",
+    "IssuedCapitalNumberOfShares",
+    "NumberOfOrdinaryShares",
+    "NumberOfOrdinarySharesOutstanding",
+    "OrdinarySharesNumber",
+    "IssuedShares",
+    "SharesInIssue",
+    "NumberOfSharesInIssue",
+    "TotalNumberOfIssuedOrdinaryShares",
+    "WeightedAverageShares",
+    "AdjustedWeightedAverageShares",
+)
+UK_EPS_TAGS = (
+    "BasicEarningsLossPerShare",
+    "BasicEarningsLossPerShareFromContinuingOperations",
+    "DilutedEarningsLossPerShare",
+    "DilutedEarningsLossPerShareFromContinuingOperations",
+)
 
 
 def uk_facts_to_cache_record(code: str, name: str, source: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
@@ -3271,7 +3546,8 @@ def uk_facts_to_cache_record(code: str, name: str, source: str, parsed: Dict[str
     debt_values = [_fact_latest(facts, (tag,)) for tag in UK_DEBT_TAGS]
     debt_values = [v for v in debt_values if v is not None]
     debt_val = sum(debt_values) if debt_values else None
-    shares = _fact_latest(facts, UK_SHARES_TAGS)
+    shares, shares_source = _uk_latest_share_count(facts)
+    report_currency = _uk_fact_currency(facts, UK_CASH_TAGS) or _uk_fact_currency(facts, UK_EQUITY_TAGS)
 
     net_cash, debt_used = compute_net_cash(
         int(cash_val) if cash_val is not None else None,
@@ -3315,6 +3591,10 @@ def uk_facts_to_cache_record(code: str, name: str, source: str, parsed: Dict[str
         "liquid_funds": int(cash_val) if cash_val is not None else None,
         "interest_bearing_debt": debt_used,
         "net_cash": net_cash,
+        "net_income": int(net_income) if net_income is not None else None,
+        "shares": shares,
+        "shares_source": shares_source,
+        "report_currency": report_currency,
         "quote_source": "yahoo",
         "fundamentals_source": "official-esef",
         "source_file": source,

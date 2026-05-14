@@ -262,6 +262,8 @@ def safe_name(value: str) -> str:
 def normalize_name_for_match(name: str) -> str:
     text = html.unescape(str(name or "")).upper()
     text = text.replace("&", " AND ")
+    text = re.sub(r"\bP\s*\.?\s*L\s*\.?\s*C\.?\b", " PLC ", text)
+    text = re.sub(r"\bL\s*\.?\s*T\s*\.?\s*D\.?\b", " LTD ", text)
     text = re.sub(r"[^A-Z0-9]+", " ", text)
     words = [w for w in text.split() if w and w not in LEGAL_WORDS]
     return " ".join(words)
@@ -278,6 +280,8 @@ def name_matches_company(source_name: str, target_name: str) -> bool:
 def normalize_nsm_company_name(name: str) -> str:
     text = html.unescape(str(name or "")).upper()
     text = text.replace("&", " AND ")
+    text = re.sub(r"\bP\s*\.?\s*L\s*\.?\s*C\.?\b", " PLC ", text)
+    text = re.sub(r"\bL\s*\.?\s*T\s*\.?\s*D\.?\b", " LTD ", text)
     text = re.sub(r"[^A-Z0-9]+", " ", text)
     return " ".join(text.split())
 
@@ -1398,10 +1402,27 @@ def collect_companies_house_accounts(args: argparse.Namespace, companies: Dict[s
     args.download_dir.mkdir(parents=True, exist_ok=True)
     args.extract_dir.mkdir(parents=True, exist_ok=True)
 
-    local_zips: List[Path] = []
+    def process_zip(zip_path: Path) -> None:
+        try:
+            rows = extract_matching_accounts(zip_path, args.extract_dir, companies)
+            if rows:
+                log(f"  extracted {len(rows)} CH matching accounts from {zip_path.name}")
+            extracted.extend(rows)
+        except zipfile.BadZipFile:
+            log(f"  bad ZIP skipped: {zip_path}")
+        finally:
+            if getattr(args, "delete_bulk_zip_after_extract", False):
+                try:
+                    zip_path.unlink(missing_ok=True)
+                    log(f"  deleted CH bulk ZIP after extract: {zip_path.name}")
+                except Exception as exc:
+                    log(f"  could not delete CH bulk ZIP {zip_path}: {exc}")
+
     if args.skip_download:
         local_zips = sorted(args.download_dir.glob("*.zip"))
         log(f"Using existing Companies House ZIPs: {len(local_zips)}")
+        for zip_path in local_zips:
+            process_zip(zip_path)
     else:
         for idx, item in enumerate(filtered, 1):
             zip_path = args.download_dir / item.label
@@ -1418,23 +1439,7 @@ def collect_companies_house_accounts(args: argparse.Namespace, companies: Dict[s
                     continue
             else:
                 log(f"[CH {idx}/{len(filtered)}] Reusing {zip_path.name}")
-            local_zips.append(zip_path)
-
-    for zip_path in local_zips:
-        try:
-            rows = extract_matching_accounts(zip_path, args.extract_dir, companies)
-            if rows:
-                log(f"  extracted {len(rows)} CH matching accounts from {zip_path.name}")
-            extracted.extend(rows)
-        except zipfile.BadZipFile:
-            log(f"  bad ZIP skipped: {zip_path}")
-        finally:
-            if getattr(args, "delete_bulk_zip_after_extract", False):
-                try:
-                    zip_path.unlink(missing_ok=True)
-                    log(f"  deleted CH bulk ZIP after extract: {zip_path.name}")
-                except Exception as exc:
-                    log(f"  could not delete CH bulk ZIP {zip_path}: {exc}")
+            process_zip(zip_path)
     return extracted
 
 
@@ -1811,6 +1816,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args.cache_output = Path(args.cache_output)
     args.audit_output = Path(args.audit_output)
     args.builder_download_dir = Path(args.builder_download_dir)
+    if args.lse_full_universe:
+        args.include_funds = True
 
     if args.auto_universe:
         result = build_universe_from_lse(args)
@@ -1916,24 +1923,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args.download_dir.mkdir(parents=True, exist_ok=True)
     args.extract_dir.mkdir(parents=True, exist_ok=True)
 
+    def process_zip(zip_path: Path) -> None:
+        try:
+            rows = extract_matching_accounts(zip_path, args.extract_dir, companies)
+            if rows:
+                log(f"Extracted {len(rows)} matching accounts from {zip_path.name}")
+            extracted.extend(rows)
+        except zipfile.BadZipFile:
+            log(f"Bad ZIP skipped: {zip_path}")
+        finally:
+            if args.delete_bulk_zip_after_extract:
+                try:
+                    zip_path.unlink(missing_ok=True)
+                    log(f"Deleted bulk ZIP after extract: {zip_path.name}")
+                except Exception as exc:
+                    log(f"Could not delete bulk ZIP {zip_path}: {exc}")
+
     if args.skip_download:
         local_zips = sorted(args.download_dir.glob("*.zip"))
         log(f"Using existing downloaded ZIPs: {len(local_zips)}")
         for zip_path in local_zips:
-            try:
-                rows = extract_matching_accounts(zip_path, args.extract_dir, companies)
-                if rows:
-                    log(f"Extracted {len(rows)} matching accounts from {zip_path.name}")
-                extracted.extend(rows)
-            except zipfile.BadZipFile:
-                log(f"Bad ZIP skipped: {zip_path}")
-            finally:
-                if args.delete_bulk_zip_after_extract:
-                    try:
-                        zip_path.unlink(missing_ok=True)
-                        log(f"Deleted bulk ZIP after extract: {zip_path.name}")
-                    except Exception as exc:
-                        log(f"Could not delete bulk ZIP {zip_path}: {exc}")
+            process_zip(zip_path)
     else:
         for idx, item in enumerate(filtered, 1):
             zip_path = args.download_dir / item.label
@@ -1950,20 +1960,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     continue
             else:
                 log(f"[{idx}/{len(filtered)}] Reusing {zip_path.name}")
-            try:
-                rows = extract_matching_accounts(zip_path, args.extract_dir, companies)
-                if rows:
-                    log(f"  extracted {len(rows)} matching accounts")
-                extracted.extend(rows)
-            except zipfile.BadZipFile:
-                log(f"  bad ZIP skipped: {zip_path}")
-            finally:
-                if args.delete_bulk_zip_after_extract:
-                    try:
-                        zip_path.unlink(missing_ok=True)
-                        log(f"  deleted bulk ZIP after extract: {zip_path.name}")
-                    except Exception as exc:
-                        log(f"  could not delete bulk ZIP {zip_path}: {exc}")
+            process_zip(zip_path)
 
     write_manifest(manifest_path, extracted)
     log(f"Extracted account files: {len(extracted)}")

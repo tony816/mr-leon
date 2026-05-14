@@ -382,6 +382,55 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(record["net_cash"], 500.0)
         self.assertEqual(record["net_cash_per_share_value"], 50.0)
 
+    def test_uk_cache_builder_uses_weighted_average_shares(self):
+        facts = {
+            "CashAndCashEquivalents": [{"value": 500.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "Equity": [{"value": 1000.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "WeightedAverageShares": [
+                {"value": 25.0, "year": 2025, "end_ord": 1, "duration_days": 365, "unit": "shares"}
+            ],
+        }
+
+        record = build_uk_cache_db.build_cache_record("ABC", "ABC PLC", facts, ["mock.xhtml"], 5)
+
+        self.assertEqual(record["shares"], 25.0)
+        self.assertEqual(record["shares_source"], "tag")
+        self.assertEqual(record["net_cash_per_share_value"], 20.0)
+
+    def test_uk_cache_builder_infers_shares_from_pence_eps(self):
+        facts = {
+            "CashAndCashEquivalents": [{"value": 500.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "Equity": [{"value": 1000.0, "year": 2025, "end_ord": 1, "duration_days": 0}],
+            "ProfitLoss": [{"value": 5_220_000.0, "year": 2025, "end_ord": 1, "duration_days": 365}],
+            "BasicEarningsLossPerShareFromContinuingOperations": [
+                {"value": 522.0, "year": 2025, "end_ord": 1, "duration_days": 365, "unit": "GBP,shares"}
+            ],
+        }
+
+        record = build_uk_cache_db.build_cache_record("ABC", "ABC PLC", facts, ["mock.xhtml"], 5)
+
+        self.assertEqual(record["shares_source"], "eps_inferred")
+        self.assertAlmostEqual(record["shares"], 1_000_000.0)
+
+    def test_nsm_name_matching_normalizes_dotted_plc(self):
+        row = collect_uk_ch_and_build_cache.LseRow(
+            ticker="BP",
+            name="BP PLC",
+            isin="GB0007980591",
+            market="MAIN MARKET",
+            instrument_type="Shares",
+        )
+        reports = [
+            {
+                "company": "BP p.l.c.",
+                "lei": "213800LH1BZH3DI6G760",
+                "download_link": "/download/bp.zip",
+            }
+        ]
+
+        indexes = collect_uk_ch_and_build_cache.build_nsm_match_indexes(reports)
+        self.assertIs(collect_uk_ch_and_build_cache.match_nsm_report_for_lse_row_indexed(row, indexes), reports[0])
+
     def test_uk_universe_placeholder_marks_missing_fundamentals(self):
         record = build_uk_cache_db.universe_placeholder_record(
             {
@@ -507,7 +556,7 @@ class RangeScanCacheTests(unittest.TestCase):
                     "US",
                     records,
                     None,
-                    None,
+                    15,
                     None,
                     None,
                     None,

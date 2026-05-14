@@ -1,0 +1,11 @@
+{
+  "jpx_total_issues": 4449,
+  "jpx_regular_company_symbols_prime_standard_growth_domestic_foreign": 3752,
+  "uploaded_rows": 3698,
+  "uploaded_unique_codes": 3692,
+  "missing_regular_company_symbols": 159,
+  "missing_if_excluding_class_or_preferred_share_codes": 153,
+  "class_or_preferred_share_codes_missing": 6,
+  "upload_codes_not_in_regular_company_filter": 99,
+  "duplicate_code_groups": 5
+}
