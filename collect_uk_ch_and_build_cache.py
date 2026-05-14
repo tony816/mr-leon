@@ -1818,6 +1818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args.builder_download_dir = Path(args.builder_download_dir)
     if args.lse_full_universe:
         args.include_funds = True
+        args.include_non_equity = True
 
     if args.auto_universe:
         result = build_universe_from_lse(args)
