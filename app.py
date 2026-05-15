@@ -3132,16 +3132,19 @@ def enrich_jp_cache_records_with_yahoo(
     applied_count = 0
     last_error = None
     jquants_client: Optional[JQuantsClient] = None
-    can_use_jquants_fallback = quote_fetcher is fetch_yahoo_quotes_batch and jquants_configured()
+    use_default_jp_quotes = quote_fetcher is fetch_yahoo_quotes_batch
+    can_use_jquants_fallback = use_default_jp_quotes and jquants_configured()
     for offset in range(0, len(symbols), 100):
         chunk = symbols[offset : offset + 100]
         if progress_cb:
-            progress_cb(f"JP quotes... {offset}/{len(symbols)}")
+            source_label = "KIS" if use_default_jp_quotes else "custom"
+            progress_cb(f"JP quotes ({source_label})... {offset}/{len(symbols)}")
         try:
-            quotes = quote_fetcher(chunk)
+            quotes = fetch_kis_jp_quotes_batch(chunk) if use_default_jp_quotes else quote_fetcher(chunk)
         except Exception as exc:
             last_error = str(exc)
-            if can_use_jquants_fallback:
+            quotes = {}
+            if not quotes and can_use_jquants_fallback:
                 try:
                     jquants_client = jquants_client or JQuantsClient()
                     quotes = fetch_jquants_quotes_for_symbols(
@@ -3152,8 +3155,6 @@ def enrich_jp_cache_records_with_yahoo(
                 except Exception as fallback_exc:
                     last_error = f"{last_error}; J-Quants fallback failed: {fallback_exc}"
                     quotes = {}
-            else:
-                quotes = {}
         for symbol in chunk:
             code = symbol.split(".", 1)[0]
             record = code_to_record.get(code)
@@ -3818,6 +3819,9 @@ class KisClient:
     def _price_url(self) -> str:
         return f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
 
+    def _overseas_price_url(self) -> str:
+        return f"{self.base_url}/uapi/overseas-price/v1/quotations/price"
+
     def _financial_ratio_url(self) -> str:
         return f"{self.base_url}/uapi/domestic-stock/v1/finance/financial-ratio"
 
@@ -3888,6 +3892,34 @@ class KisClient:
             listed_shares=listed_shares,
             net_cash_per_share_ratio=net_cash_ratio,
         )
+
+    def get_overseas_stock_quote(self, exchange_code: str, symbol: str) -> Dict[str, Optional[float]]:
+        headers = self._authorized_headers("HHDFS00000300")
+        params = {
+            "AUTH": "",
+            "EXCD": exchange_code,
+            "SYMB": symbol,
+        }
+        resp = self.session.get(self._overseas_price_url(), headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            raise KisError(f"Overseas price request failed: HTTP {resp.status_code} {resp.text}")
+
+        data = resp.json()
+        output = data.get("output", {}) if isinstance(data, dict) else {}
+        if not output:
+            raise KisError(f"Unexpected overseas price response payload: {data}")
+        price = parse_float(output.get("last"))
+        if price is None:
+            raise KisError(f"Overseas price response missing current price: {data}")
+        return {
+            "symbol": f"{symbol}.T" if exchange_code == "TSE" else symbol,
+            "price": price,
+            "per": None,
+            "pbr": None,
+            "market_cap": None,
+            "currency": "JPY" if exchange_code == "TSE" else None,
+            "source": "kis",
+        }
 
     def _first_in_output(self, payload) -> Dict:
         if isinstance(payload, list) and payload:
@@ -4023,6 +4055,35 @@ def fetch_kis_quotes_batch(tickers: List[str]) -> Dict[str, Dict[str, Optional[f
             "source": "kis",
         }
         for alias in {symbol, code, f"{code}.KS", f"{code}.KQ"}:
+            if alias:
+                quotes[alias.upper()] = quote
+
+    if not quotes and last_error:
+        raise KisError(last_error)
+    return quotes
+
+
+def fetch_kis_jp_quotes_batch(tickers: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    app_key, app_secret, base_url = load_keys()
+    client = KisClient(app_key, app_secret, base_url=base_url)
+    quotes: Dict[str, Dict[str, Optional[float]]] = {}
+    seen_codes = set()
+    last_error = None
+
+    for raw_symbol in tickers or []:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            continue
+        code = normalize_jp_listed_code(symbol.split(".", 1)[0])
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        try:
+            quote = client.get_overseas_stock_quote("TSE", code)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        for alias in {symbol, code, f"{code}.T"}:
             if alias:
                 quotes[alias.upper()] = quote
 
