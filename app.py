@@ -3088,6 +3088,39 @@ def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str
         record["quote_source"] = quote.get("source")
 
 
+def fetch_jquants_quotes_for_symbols(
+    symbols: List[str],
+    *,
+    client: Optional[JQuantsClient] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Dict[str, Optional[float]]]:
+    if not symbols:
+        return {}
+    client = client or JQuantsClient()
+    quotes: Dict[str, Dict[str, Optional[float]]] = {}
+    total = len(symbols)
+    for idx, symbol in enumerate(symbols, start=1):
+        code = normalize_jp_listed_code(symbol.split(".", 1)[0])
+        if progress_cb:
+            progress_cb(f"JP quotes fallback (J-Quants)... {idx}/{total}")
+        rows = client.get_daily_quotes(code)
+        quote = latest_jquants_quote(rows)
+        price_val = jquants_value(quote, "AdjustmentClose", "AdjC", "Close", "C")
+        if price_val is None:
+            continue
+        yahoo_symbol = f"{code}.T"
+        quotes[yahoo_symbol] = {
+            "symbol": yahoo_symbol,
+            "price": price_val,
+            "per": None,
+            "pbr": None,
+            "market_cap": None,
+            "currency": "JPY",
+            "source": "j-quants",
+        }
+    return quotes
+
+
 def enrich_jp_cache_records_with_yahoo(
     records: List[Dict[str, Any]],
     quote_fetcher: Callable[[List[str]], Dict[str, Dict[str, Optional[float]]]] = fetch_yahoo_quotes_batch,
@@ -3098,6 +3131,8 @@ def enrich_jp_cache_records_with_yahoo(
     symbols = [f"{code}.T" for code in code_to_record if code]
     applied_count = 0
     last_error = None
+    jquants_client: Optional[JQuantsClient] = None
+    can_use_jquants_fallback = quote_fetcher is fetch_yahoo_quotes_batch and jquants_configured()
     for offset in range(0, len(symbols), 100):
         chunk = symbols[offset : offset + 100]
         if progress_cb:
@@ -3106,7 +3141,19 @@ def enrich_jp_cache_records_with_yahoo(
             quotes = quote_fetcher(chunk)
         except Exception as exc:
             last_error = str(exc)
-            quotes = {}
+            if can_use_jquants_fallback:
+                try:
+                    jquants_client = jquants_client or JQuantsClient()
+                    quotes = fetch_jquants_quotes_for_symbols(
+                        chunk,
+                        client=jquants_client,
+                        progress_cb=progress_cb,
+                    )
+                except Exception as fallback_exc:
+                    last_error = f"{last_error}; J-Quants fallback failed: {fallback_exc}"
+                    quotes = {}
+            else:
+                quotes = {}
         for symbol in chunk:
             code = symbol.split(".", 1)[0]
             record = code_to_record.get(code)
