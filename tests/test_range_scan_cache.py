@@ -745,6 +745,72 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual([len(call) for call in calls], [200, 1])
 
+    def test_uk_cached_scan_prefilters_before_quote_enrichment(self):
+        records = [
+            {
+                "country": "UK",
+                "code": "PASS",
+                "name": "Pass PLC",
+                "liabilities_ratio": "40.00",
+                "interest_bearing_debt_ratio": "10.00",
+                "net_cash_per_share_value": 2,
+            },
+            {
+                "country": "UK",
+                "code": "DEBT",
+                "name": "Debt PLC",
+                "liabilities_ratio": "140.00",
+                "interest_bearing_debt_ratio": "10.00",
+                "net_cash_per_share_value": 2,
+            },
+            {
+                "country": "UK",
+                "code": "CASH",
+                "name": "Negative Cash PLC",
+                "liabilities_ratio": "40.00",
+                "interest_bearing_debt_ratio": "10.00",
+                "net_cash_per_share_value": -2,
+            },
+        ]
+        calls = []
+
+        def quote_fetcher(symbols):
+            calls.append(list(symbols))
+            return {
+                "PASS.L": {
+                    "symbol": "PASS.L",
+                    "price": 4,
+                    "per": 8,
+                    "pbr": 1.1,
+                    "currency": "GBP",
+                    "source": "test",
+                }
+            }
+
+        rows, total, last_error = app.scan_cached_fundamentals_records(
+            "UK",
+            records,
+            None,
+            15,
+            None,
+            2,
+            None,
+            100,
+            None,
+            50,
+            0.1,
+            None,
+            None,
+            None,
+            None,
+            quote_fetcher=quote_fetcher,
+        )
+
+        self.assertEqual(total, 3)
+        self.assertIsNone(last_error)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(calls, [["PASS.L"]])
+
 
 if __name__ == "__main__":
     unittest.main()

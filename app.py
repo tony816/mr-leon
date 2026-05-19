@@ -2907,7 +2907,7 @@ def scan_cached_fundamentals_records(
 ) -> Tuple[List[Tuple[Any, ...]], int, Optional[str]]:
     original_total = len(records)
     quote_candidates = records
-    if country in ("KR", "JP"):
+    if country in ("KR", "JP", "UK"):
         quote_candidates = [
             record
             for record in records
