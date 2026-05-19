@@ -2779,7 +2779,7 @@ def cache_record_passes_filters(
     op_delta_min: Optional[float],
     net_delta_min: Optional[float],
 ) -> bool:
-    if record.get("fundamentals_status") == "missing_official_fundamentals":
+    if record.get("fundamentals_status") in {"missing_official_fundamentals", "unavailable_fundamentals"}:
         return False
 
     per_val = parse_float(record.get("per"))
@@ -2821,7 +2821,7 @@ def cache_record_can_pass_static_filters(
     op_delta_min: Optional[float],
     net_delta_min: Optional[float],
 ) -> bool:
-    if record.get("fundamentals_status") == "missing_official_fundamentals":
+    if record.get("fundamentals_status") in {"missing_official_fundamentals", "unavailable_fundamentals"}:
         return False
 
     debt_val = parse_float(record.get("liabilities_ratio"))

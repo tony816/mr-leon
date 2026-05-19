@@ -412,6 +412,82 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(record["shares_source"], "eps_inferred")
         self.assertAlmostEqual(record["shares"], 1_000_000.0)
 
+    def test_uk_manual_fundamentals_override_fills_missing_placeholder(self):
+        records = {
+            "MISS": {
+                "country": "UK",
+                "code": "MISS",
+                "name": "Missing PLC",
+                "fundamentals_status": "missing_official_fundamentals",
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "manual.csv"
+            path.write_text(
+                "\n".join(
+                    [
+                        "code,name,report_currency,quote_currency,price,cash,debt,liabilities,equity,shares,revenue,op_income,net_income,bsns_year,source_file",
+                        "MISS,Missing PLC,GBP,GBX,200,100,20,40,80,10,0,-5,-6,2025,manual-source",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            audit = []
+            count = build_uk_cache_db.apply_manual_fundamentals(
+                records,
+                str(path),
+                audit,
+                window_years=5,
+                override_existing=False,
+            )
+
+        record = records["MISS"]
+        self.assertEqual(count, 1)
+        self.assertEqual(record["fundamentals_status"], "manual_fundamentals_loaded")
+        self.assertEqual(record["net_cash"], 80.0)
+        self.assertEqual(record["net_cash_per_share_value"], 8.0)
+        self.assertEqual(record["net_cash_per_share_ratio"], "400.00%")
+
+    def test_uk_unavailable_fundamentals_are_excluded_from_cache_scan(self):
+        records = {
+            "GONE": {
+                "country": "UK",
+                "code": "GONE",
+                "name": "Gone PLC",
+                "fundamentals_status": "missing_official_fundamentals",
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "unavailable.csv"
+            path.write_text(
+                "code,name,reason,source_file\nGONE,Gone PLC,In liquidation,source-url\n",
+                encoding="utf-8",
+            )
+            count = build_uk_cache_db.apply_unavailable_fundamentals(records, str(path), [])
+
+        self.assertEqual(count, 1)
+        self.assertEqual(records["GONE"]["fundamentals_status"], "unavailable_fundamentals")
+        rows, total, last_error = app.scan_cached_fundamentals_records(
+            "UK",
+            list(records.values()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        self.assertEqual(total, 1)
+        self.assertIsNone(last_error)
+        self.assertEqual(rows, [])
+
     def test_uk_yahoo_timeseries_fallback_populates_missing_placeholder(self):
         placeholder = build_uk_cache_db.universe_placeholder_record(
             {

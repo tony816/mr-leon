@@ -63,6 +63,8 @@ except Exception:  # pragma: no cover
 DEFAULT_OUTPUT = Path("data") / "uk_fundamentals_cache.jsonl"
 DEFAULT_DOWNLOAD_DIR = Path("data") / "uk_filings"
 DEFAULT_AUDIT_OUTPUT = Path("data") / "uk_cache_build_audit.csv"
+DEFAULT_MANUAL_FUNDAMENTALS_CSV = Path("data") / "uk_manual_fundamentals_overrides.csv"
+DEFAULT_UNAVAILABLE_FUNDAMENTALS_CSV = Path("data") / "uk_unavailable_fundamentals.csv"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
 YAHOO_TIMESERIES_URL = "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
@@ -1059,6 +1061,24 @@ def format_ratio(value: Optional[float]) -> str:
     return f"{value:,.2f}" if value is not None else "N/A"
 
 
+def parse_manual_number(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text or text.upper() in {"N/A", "NA", "NONE", "-", "NULL"}:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("()")
+    text = re.sub(r"[,\s£$€¥₩]", "", text)
+    if text.endswith("%"):
+        text = text[:-1]
+    try:
+        number = float(text)
+    except Exception:
+        return None
+    return -number if negative else number
+
+
 def format_per_share(cash_value: Optional[float], shares: Optional[float]) -> str:
     if cash_value is None or shares in (None, 0):
         return "N/A"
@@ -1526,6 +1546,220 @@ def fill_missing_records_from_yahoo_timeseries(
     return filled, attempted
 
 
+def manual_fundamentals_record(base_record: Dict[str, Any], row: Dict[str, Any], window_years: int) -> Dict[str, Any]:
+    code = normalize_ticker(first_value(row, ("code", "ticker", "symbol")) or str(base_record.get("code") or ""))
+    name = first_value(row, ("name", "company_name", "issuer_name")) or str(base_record.get("name") or code)
+    cash = parse_manual_number(first_value(row, ("cash", "cash_and_cash_equivalents")))
+    short_term_investments = parse_manual_number(
+        first_value(row, ("short_term_investments", "marketable_securities", "cash_investments"))
+    )
+    liquid_funds = parse_manual_number(first_value(row, ("liquid_funds_total", "cash_and_short_term_investments")))
+    if liquid_funds is None:
+        liquid_parts = [value for value in (cash, short_term_investments) if value is not None]
+        liquid_funds = sum(liquid_parts) if liquid_parts else cash
+    debt = parse_manual_number(first_value(row, ("debt", "interest_bearing_debt", "total_debt")))
+    liabilities = parse_manual_number(first_value(row, ("liabilities", "total_liabilities")))
+    equity = parse_manual_number(first_value(row, ("equity", "total_equity", "shareholders_equity")))
+    shares = parse_manual_number(first_value(row, ("shares", "shares_outstanding", "ordinary_shares")))
+    revenue = parse_manual_number(first_value(row, ("revenue", "sales", "turnover")))
+    op_income = parse_manual_number(first_value(row, ("op_income", "operating_income", "operating_profit")))
+    net_income = parse_manual_number(first_value(row, ("net_income", "profit_loss", "profit")))
+    eps = parse_manual_number(first_value(row, ("eps", "earnings_per_share")))
+    bps = parse_manual_number(first_value(row, ("bps", "book_value_per_share")))
+    price = parse_manual_number(first_value(row, ("price", "market_price")))
+    source_file = first_value(row, ("source_file", "source_url", "url"))
+    report_currency = first_value(row, ("report_currency", "currency")) or str(base_record.get("report_currency") or "")
+    quote_currency = first_value(row, ("quote_currency", "market_currency"))
+    bsns_year = first_value(row, ("bsns_year", "fiscal_year", "year")) or str(base_record.get("bsns_year") or "-")
+    notes = first_value(row, ("notes", "reason"))
+
+    net_cash, debt_used = compute_net_cash(liquid_funds, debt)
+    liabilities_ratio = (liabilities / equity * 100) if liabilities is not None and equity not in (None, 0) else None
+    debt_ratio = (debt_used / equity * 100) if debt_used is not None and equity not in (None, 0) else None
+    net_cash_ps = (net_cash / shares) if net_cash is not None and shares not in (None, 0) else None
+    if eps is None and net_income is not None and shares not in (None, 0):
+        eps = net_income / shares
+    if bps is None and equity is not None and shares not in (None, 0):
+        bps = equity / shares
+
+    price_major = None
+    if price is not None:
+        price_major = price / 100 if quote_currency in ("GBp", "GBX") else price
+    quote_major_currency = yahoo_quote_major_currency(quote_currency)
+    currency_matches = bool(report_currency and quote_major_currency and report_currency.upper() == quote_major_currency.upper())
+    per_val = None
+    pbr_val = None
+    net_cash_ratio = None
+    if currency_matches and price_major not in (None, 0):
+        if eps not in (None, 0):
+            per_val = price_major / eps
+        elif shares not in (None, 0) and net_income not in (None, 0):
+            per_val = (price_major * shares) / net_income
+        if bps not in (None, 0):
+            pbr_val = price_major / bps
+        elif shares not in (None, 0) and equity not in (None, 0):
+            pbr_val = (price_major * shares) / equity
+        if net_cash_ps is not None:
+            net_cash_ratio = net_cash_ps / price_major * 100
+
+    coverage = {
+        "revenue": revenue is not None,
+        "operating_income": op_income is not None,
+        "net_income": net_income is not None,
+        "cash": liquid_funds is not None,
+        "equity": equity is not None,
+        "liabilities": liabilities is not None,
+        "interest_bearing_debt": debt_used is not None,
+        "shares": shares is not None,
+    }
+    record = dict(base_record)
+    record.update(
+        {
+            "country": "UK",
+            "code": code,
+            "name": name or code,
+            "price": format_ratio(price) if price is not None else record.get("price", "N/A"),
+            "per": format_ratio(per_val),
+            "pbr": format_ratio(pbr_val),
+            "liabilities_ratio": format_ratio(liabilities_ratio),
+            "interest_bearing_debt_ratio": format_ratio(debt_ratio),
+            "net_cash_per_share": format_per_share(net_cash, shares),
+            "net_cash_per_share_ratio": f"{net_cash_ratio:,.2f}%" if net_cash_ratio is not None else "N/A",
+            "net_cash_per_share_value": net_cash_ps,
+            "sales": format_amount(revenue),
+            "op_income": format_amount(op_income),
+            "equity": format_amount(equity),
+            "sales_growth_5y": "N/A (manual override)",
+            "op_growth_5y": "N/A (manual override)",
+            "net_income_growth_5y": "N/A (manual override)",
+            "sales_growth_5y_avg_pct": None,
+            "op_growth_5y_avg_pct": None,
+            "net_income_growth_5y_avg_pct": None,
+            "liabilities_ratio_value": liabilities_ratio,
+            "interest_bearing_debt_ratio_value": debt_ratio,
+            "liquid_funds_total": liquid_funds,
+            "liquid_funds": liquid_funds,
+            "interest_bearing_debt": debt_used,
+            "interest_bearing_debt_source": "manual" if debt is not None else ("assumed_zero" if debt_used == 0.0 else ""),
+            "net_cash": net_cash,
+            "net_income": net_income,
+            "shares": shares,
+            "shares_source": "manual",
+            "eps": eps,
+            "bps": bps,
+            "report_currency": report_currency or None,
+            "currency": quote_currency or record.get("currency"),
+            "quote_currency": quote_currency or record.get("quote_currency"),
+            "quote_price_major_unit": price_major,
+            "quote_source": "manual" if price is not None else record.get("quote_source", "manual"),
+            "fundamentals_source": first_value(row, ("fundamentals_source", "source")) or "manual",
+            "fundamentals_status": "manual_fundamentals_loaded",
+            "fundamentals_error": "",
+            "fundamentals_notes": notes,
+            "source_file": source_file,
+            "source_file_count": 1 if source_file else 0,
+            "coverage": coverage,
+            "bsns_year": bsns_year,
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+    )
+    return record
+
+
+def apply_manual_fundamentals(
+    records: Dict[str, Dict[str, Any]],
+    path: Optional[str],
+    audit: List[AuditRow],
+    *,
+    window_years: int,
+    override_existing: bool,
+) -> int:
+    if not path:
+        return 0
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return 0
+    count = 0
+    for row in read_table(csv_path):
+        code = normalize_ticker(first_value(row, ("code", "ticker", "symbol")))
+        if not code:
+            continue
+        existing = records.get(code)
+        if existing and existing.get("fundamentals_status") != "missing_official_fundamentals" and not override_existing:
+            continue
+        base_record = existing or {
+            "country": "UK",
+            "code": code,
+            "name": first_value(row, ("name", "company_name", "issuer_name")) or code,
+            "fundamentals_status": "missing_official_fundamentals",
+        }
+        try:
+            record = manual_fundamentals_record(base_record, row, window_years)
+            records[code] = record
+            count += 1
+            audit.append(
+                AuditRow(
+                    code,
+                    str(record.get("name") or code),
+                    str(record.get("source_file") or csv_path),
+                    "manual_fundamentals_override",
+                    "ok",
+                    output_record=json.dumps(record.get("coverage", {}), ensure_ascii=False),
+                )
+            )
+        except Exception as exc:
+            audit.append(AuditRow(code, str(base_record.get("name") or code), str(csv_path), "manual_fundamentals_failed", str(exc)))
+    return count
+
+
+def apply_unavailable_fundamentals(records: Dict[str, Dict[str, Any]], path: Optional[str], audit: List[AuditRow]) -> int:
+    if not path:
+        return 0
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return 0
+    count = 0
+    for row in read_table(csv_path):
+        code = normalize_ticker(first_value(row, ("code", "ticker", "symbol")))
+        if not code:
+            continue
+        existing = records.get(code)
+        if existing and existing.get("fundamentals_status") != "missing_official_fundamentals":
+            continue
+        record = dict(existing or {})
+        name = first_value(row, ("name", "company_name", "issuer_name")) or str(record.get("name") or code)
+        reason = first_value(row, ("reason", "notes", "fundamentals_error"))
+        source_file = first_value(row, ("source_file", "source_url", "url"))
+        record.update(
+            {
+                "country": "UK",
+                "code": code,
+                "name": name,
+                "fundamentals_source": first_value(row, ("source", "fundamentals_source")) or "unavailable",
+                "fundamentals_status": "unavailable_fundamentals",
+                "fundamentals_error": reason or "No current usable public fundamentals source",
+                "fundamentals_notes": reason,
+                "source_file": source_file,
+                "source_file_count": 0,
+                "coverage": {
+                    "revenue": False,
+                    "operating_income": False,
+                    "net_income": False,
+                    "cash": False,
+                    "equity": False,
+                    "liabilities": False,
+                    "interest_bearing_debt": False,
+                    "shares": False,
+                },
+                "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            }
+        )
+        records[code] = record
+        count += 1
+        audit.append(AuditRow(code, name, source_file or str(csv_path), "fundamentals_unavailable", reason))
+    return count
+
+
 def build_cache_record(ticker: str, name: str, facts: Dict[str, List[Dict[str, Any]]], source_files: Sequence[str], window_years: int) -> Dict[str, Any]:
     revenue = latest_fact(facts, REVENUE_TAGS, annual=True)
     op_income = latest_fact(facts, OP_INCOME_TAGS, annual=True)
@@ -1829,7 +2063,20 @@ def build(args: argparse.Namespace) -> int:
             audit=audit,
         )
 
-    if built or placeholder_count or yahoo_fallback_count:
+    manual_fallback_count = apply_manual_fundamentals(
+        records,
+        getattr(args, "manual_fundamentals_csv", None),
+        audit,
+        window_years=args.years,
+        override_existing=getattr(args, "manual_fundamentals_override_existing", False),
+    )
+    unavailable_count = apply_unavailable_fundamentals(
+        records,
+        getattr(args, "unavailable_fundamentals_csv", None),
+        audit,
+    )
+
+    if built or placeholder_count or yahoo_fallback_count or manual_fallback_count or unavailable_count:
         write_jsonl_atomic(output_path, records)
     write_audit(Path(args.audit_output), audit)
 
@@ -1840,9 +2087,13 @@ def build(args: argparse.Namespace) -> int:
         print(f"Missing official fundamentals placeholders: {placeholder_count}")
     if getattr(args, "yahoo_timeseries_fallback_missing", False):
         print(f"Yahoo timeseries fallback filled: {yahoo_fallback_count}/{yahoo_fallback_attempted}")
+    if manual_fallback_count:
+        print(f"Manual fundamentals overrides applied: {manual_fallback_count}")
+    if unavailable_count:
+        print(f"Unavailable fundamentals marked: {unavailable_count}")
     print(f"Output: {output_path}")
     print(f"Audit: {args.audit_output}")
-    return 0 if built or placeholder_count or yahoo_fallback_count else 1
+    return 0 if built or placeholder_count or yahoo_fallback_count or manual_fallback_count or unavailable_count else 1
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1868,6 +2119,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--yahoo-timeseries-fallback-limit", type=int, help="Limit Yahoo fallback rows for smoke tests")
     parser.add_argument("--yahoo-timeseries-timeout", type=int, default=15, help="Yahoo fallback HTTP timeout seconds")
     parser.add_argument("--yahoo-timeseries-sleep", type=float, default=0.05, help="Sleep seconds between Yahoo fallback rows")
+    parser.add_argument("--manual-fundamentals-csv", default=str(DEFAULT_MANUAL_FUNDAMENTALS_CSV), help="Manual fallback CSV for hard-to-source UK fundamentals; default data/uk_manual_fundamentals_overrides.csv when present")
+    parser.add_argument("--manual-fundamentals-override-existing", action="store_true", help="Apply manual fundamentals CSV even when a non-missing record already exists")
+    parser.add_argument("--unavailable-fundamentals-csv", default=str(DEFAULT_UNAVAILABLE_FUNDAMENTALS_CSV), help="CSV of listed issuers whose fundamentals are unavailable/in liquidation; default data/uk_unavailable_fundamentals.csv when present")
     parser.add_argument("--write-example-manifest", help="Write an example manifest CSV then exit")
     return parser.parse_args(argv)
 
