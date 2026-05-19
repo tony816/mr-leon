@@ -748,6 +748,51 @@ def is_equity_like_lse_row(item: LseRow, include_funds: bool, include_non_equity
     return bool(item.name and not any(hint in text for hint in NON_EQUITY_HINTS))
 
 
+def lse_raw_value(item: LseRow, candidates: Sequence[str]) -> str:
+    return first_value(item.raw, candidates)
+
+
+def is_lse_uk_incorporated_row(item: LseRow) -> bool:
+    country = lse_raw_value(
+        item,
+        (
+            "Country of Incorporation",
+            "Issuer Country",
+            "Country",
+            "Domicile",
+        ),
+    )
+    country_norm = re.sub(r"[^A-Z]+", "", country.upper())
+    return country_norm in {"UNITEDKINGDOM", "UK", "GB", "GREATBRITAIN"}
+
+
+def is_lse_company_share_row(item: LseRow) -> bool:
+    mifir_code = lse_raw_value(item, ("MiFIR Identifier Code", "MIFIR Identifier Code")).upper()
+    mifir_name = lse_raw_value(
+        item,
+        (
+            "MiFIR Identifier Name",
+            "MiFIR Indentifier Name",
+            "MIFIR Identifier Name",
+            "MIFIR Indentifier Name",
+        ),
+    ).upper()
+    listing_category = lse_raw_value(item, ("FCA Listing Category", "Listing Category")).upper()
+    text = " ".join([item.name, item.instrument_type, item.market, mifir_code, mifir_name, listing_category]).upper()
+
+    if mifir_code and mifir_code != "SHRS":
+        return False
+    if any(hint in text for hint in ("ETF", "ETC", "ETN", "EXCHANGE TRADED", "OPEN-ENDED INVESTMENT")):
+        return False
+    if any(hint in text for hint in ("CLOSED-ENDED INVESTMENT FUND", "INVESTMENT FUNDS")):
+        return False
+    if any(hint in text for hint in ("DEPOSITARY RECEIPT", "DEPOSITORY RECEIPT", "CERTIFICATE")):
+        return False
+    if any(hint in text for hint in ("BOND", "NOTE", "DEBT", "WARRANT", "GILT", "TREASURY", "PREFERENCE", "PREF")):
+        return False
+    return bool(item.ticker and item.name)
+
+
 def load_lse_rows(args: argparse.Namespace) -> List[LseRow]:
     report_path = download_lse_report(args)
     raw_rows = read_table_file(report_path)
@@ -760,12 +805,21 @@ def load_lse_rows(args: argparse.Namespace) -> List[LseRow]:
             continue
         if not is_equity_like_lse_row(item, args.include_funds, args.include_non_equity):
             continue
+        if getattr(args, "lse_company_shares_only", False) and not is_lse_company_share_row(item):
+            continue
+        if getattr(args, "lse_uk_incorporated_only", False) and not is_lse_uk_incorporated_row(item):
+            continue
         key = (compact_name(item.name), item.isin or item.ticker)
         if key in seen:
             continue
         seen.add(key)
         out.append(item)
-    log(f"LSE equity-like issuer/instrument rows: {len(out)}")
+    label = "LSE equity-like issuer/instrument rows"
+    if getattr(args, "lse_company_shares_only", False):
+        label = "LSE company share rows"
+    if getattr(args, "lse_uk_incorporated_only", False):
+        label += " (UK incorporated)"
+    log(f"{label}: {len(out)}")
     return out
 
 # -----------------------------------------------------------------------------
@@ -1720,6 +1774,12 @@ def run_builder(args: argparse.Namespace, manifest_path: Path) -> int:
         cmd.append("--allow-missing-ticker")
     if getattr(args, "universe_all_csv", None):
         cmd.extend(["--universe-all-csv", str(args.universe_all_csv)])
+    if getattr(args, "yahoo_timeseries_fallback_missing", False):
+        cmd.append("--yahoo-timeseries-fallback-missing")
+        if args.yahoo_timeseries_fallback_limit is not None:
+            cmd.extend(["--yahoo-timeseries-fallback-limit", str(args.yahoo_timeseries_fallback_limit)])
+        cmd.extend(["--yahoo-timeseries-timeout", str(args.yahoo_timeseries_timeout)])
+        cmd.extend(["--yahoo-timeseries-sleep", str(args.yahoo_timeseries_sleep)])
     log("Running builder:")
     log(" ".join(f'\"{c}\"' if " " in c else c for c in cmd))
     return subprocess.call(cmd)
@@ -1753,6 +1813,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--force-lse-download", action="store_true", help="Redownload LSE report")
     parser.add_argument("--include-funds", action="store_true", help="Keep funds/REITs/ETF-like rows in LSE universe")
     parser.add_argument("--include-non-equity", action="store_true", help="Do not filter out non-equity instruments")
+    parser.add_argument("--lse-company-shares-only", action="store_true", help="Keep only company share instruments; exclude ETF/ETN/funds/DR/certificates")
+    parser.add_argument("--lse-uk-incorporated-only", action="store_true", help="Keep only LSE rows whose country of incorporation is United Kingdom")
     parser.add_argument("--max-lse-rows", type=int, help="Limit LSE rows for smoke test")
 
     # Companies House API mapping options
@@ -1794,6 +1856,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--build-cache", action="store_true", help="Call build_uk_cache_db.py after manifest creation")
     parser.add_argument("--allow-missing-ticker", action="store_true", help="Pass --allow-missing-ticker to builder")
     parser.add_argument("--growth-years", type=int, default=5, help="Growth window passed to builder")
+    parser.add_argument("--yahoo-timeseries-fallback-missing", action="store_true", help="Pass Yahoo fundamentals time-series fallback for missing UK universe rows to builder")
+    parser.add_argument("--yahoo-timeseries-fallback-limit", type=int, help="Limit Yahoo fallback rows for smoke tests")
+    parser.add_argument("--yahoo-timeseries-timeout", type=int, default=15, help="Yahoo fallback HTTP timeout seconds")
+    parser.add_argument("--yahoo-timeseries-sleep", type=float, default=0.05, help="Sleep seconds between Yahoo fallback rows")
     parser.add_argument("--force", action="store_true", help="Pass --force to builder")
     parser.add_argument("--rebuild-existing", action="store_true", help="Pass --rebuild-existing to builder")
 

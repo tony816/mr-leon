@@ -3016,10 +3016,16 @@ def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str
     shares = parse_float(record.get("shares"))
     if shares is None:
         shares = parse_float(record.get("float_shares"))
+    if shares is None:
+        shares = parse_float(quote.get("shares") if quote else None)
     net_income = parse_float(record.get("net_income"))
     equity = parse_float(record.get("equity"))
     eps = parse_float(record.get("eps"))
     bps = parse_float(record.get("bps"))
+    if eps is None:
+        eps = parse_float(quote.get("eps") if quote else None)
+    if bps is None:
+        bps = parse_float(quote.get("bps") if quote else None)
     market_cap = quote.get("market_cap") if quote else None
     if market_cap is None:
         market_cap = price_major * shares if price_major is not None and shares else None
@@ -3059,6 +3065,13 @@ def apply_quote_to_cache_record(record: Dict[str, Any], quote: Optional[Dict[str
         record["per"] = f"{per_val:,.2f}"
     if pbr_val is not None:
         record["pbr"] = f"{pbr_val:,.2f}"
+    if shares is not None and not record.get("shares"):
+        record["shares"] = shares
+        record["shares_source"] = quote.get("source") if quote else "quote"
+    if eps is not None and not record.get("eps"):
+        record["eps"] = eps
+    if bps is not None and not record.get("bps"):
+        record["bps"] = bps
 
     net_cash_ps = parse_float(record.get("net_cash_per_share_value"))
     if net_cash_ps is None:
@@ -3131,30 +3144,21 @@ def enrich_jp_cache_records_with_yahoo(
     symbols = [f"{code}.T" for code in code_to_record if code]
     applied_count = 0
     last_error = None
-    jquants_client: Optional[JQuantsClient] = None
     use_default_jp_quotes = quote_fetcher is fetch_yahoo_quotes_batch
-    can_use_jquants_fallback = use_default_jp_quotes and jquants_configured()
     for offset in range(0, len(symbols), 100):
         chunk = symbols[offset : offset + 100]
         if progress_cb:
             source_label = "KIS" if use_default_jp_quotes else "custom"
             progress_cb(f"JP quotes ({source_label})... {offset}/{len(symbols)}")
         try:
-            quotes = fetch_kis_jp_quotes_batch(chunk) if use_default_jp_quotes else quote_fetcher(chunk)
+            quotes = (
+                fetch_kis_jp_quotes_batch(chunk, progress_cb=progress_cb)
+                if use_default_jp_quotes
+                else quote_fetcher(chunk)
+            )
         except Exception as exc:
             last_error = str(exc)
             quotes = {}
-            if not quotes and can_use_jquants_fallback:
-                try:
-                    jquants_client = jquants_client or JQuantsClient()
-                    quotes = fetch_jquants_quotes_for_symbols(
-                        chunk,
-                        client=jquants_client,
-                        progress_cb=progress_cb,
-                    )
-                except Exception as fallback_exc:
-                    last_error = f"{last_error}; J-Quants fallback failed: {fallback_exc}"
-                    quotes = {}
         for symbol in chunk:
             code = symbol.split(".", 1)[0]
             record = code_to_record.get(code)
@@ -3799,6 +3803,8 @@ class PriceSnapshot:
 class KisClient:
     """Minimal client for Korea Investment OpenAPI to get price/PER/PBR and simple financials."""
 
+    _shared_tokens: Dict[Tuple[str, str], Tuple[str, float]] = {}
+
     def __init__(
         self,
         app_key: str,
@@ -3822,6 +3828,9 @@ class KisClient:
     def _overseas_price_url(self) -> str:
         return f"{self.base_url}/uapi/overseas-price/v1/quotations/price"
 
+    def _overseas_price_detail_url(self) -> str:
+        return f"{self.base_url}/uapi/overseas-price/v1/quotations/price-detail"
+
     def _financial_ratio_url(self) -> str:
         return f"{self.base_url}/uapi/domestic-stock/v1/finance/financial-ratio"
 
@@ -3831,6 +3840,11 @@ class KisClient:
     def _ensure_token(self) -> str:
         now = time.time()
         if self._token and now < self._token_expiry - 30:
+            return self._token
+        cache_key = (self.base_url, self.app_key)
+        cached = self._shared_tokens.get(cache_key)
+        if cached and now < cached[1] - 30:
+            self._token, self._token_expiry = cached
             return self._token
 
         payload = {
@@ -3850,6 +3864,7 @@ class KisClient:
 
         self._token = access_token
         self._token_expiry = now + int(expires_in or 0)
+        self._shared_tokens[cache_key] = (self._token, self._token_expiry)
         return access_token
 
     def _authorized_headers(self, tr_id: str) -> Dict[str, str]:
@@ -3918,6 +3933,37 @@ class KisClient:
             "pbr": None,
             "market_cap": None,
             "currency": "JPY" if exchange_code == "TSE" else None,
+            "source": "kis",
+        }
+
+    def get_overseas_stock_quote_detail(self, exchange_code: str, symbol: str) -> Dict[str, Optional[float]]:
+        headers = self._authorized_headers("HHDFS76200200")
+        params = {
+            "AUTH": "",
+            "EXCD": exchange_code,
+            "SYMB": symbol,
+        }
+        resp = self.session.get(self._overseas_price_detail_url(), headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            raise KisError(f"Overseas price-detail request failed: HTTP {resp.status_code} {resp.text}")
+
+        data = resp.json()
+        output = data.get("output", {}) if isinstance(data, dict) else {}
+        if not output:
+            raise KisError(f"Unexpected overseas price-detail response payload: {data}")
+        price = parse_float(output.get("last"))
+        if price is None:
+            raise KisError(f"Overseas price-detail response missing current price: {data}")
+        return {
+            "symbol": f"{symbol}.T" if exchange_code == "TSE" else symbol,
+            "price": price,
+            "per": parse_float(output.get("perx")),
+            "pbr": parse_float(output.get("pbrx")),
+            "eps": parse_float(output.get("epsx")),
+            "bps": parse_float(output.get("bpsx")),
+            "shares": parse_float(output.get("shar")),
+            "market_cap": parse_float(output.get("tomv")),
+            "currency": output.get("curr") or ("JPY" if exchange_code == "TSE" else None),
             "source": "kis",
         }
 
@@ -4063,23 +4109,28 @@ def fetch_kis_quotes_batch(tickers: List[str]) -> Dict[str, Dict[str, Optional[f
     return quotes
 
 
-def fetch_kis_jp_quotes_batch(tickers: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+def fetch_kis_jp_quotes_batch(
+    tickers: List[str],
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Dict[str, Optional[float]]]:
     app_key, app_secret, base_url = load_keys()
     client = KisClient(app_key, app_secret, base_url=base_url)
     quotes: Dict[str, Dict[str, Optional[float]]] = {}
     seen_codes = set()
     last_error = None
+    symbols = [str(raw_symbol or "").strip().upper() for raw_symbol in (tickers or []) if str(raw_symbol or "").strip()]
+    total = len(symbols)
 
-    for raw_symbol in tickers or []:
-        symbol = str(raw_symbol or "").strip().upper()
-        if not symbol:
-            continue
+    for idx, symbol in enumerate(symbols, start=1):
         code = normalize_jp_listed_code(symbol.split(".", 1)[0])
         if not code or code in seen_codes:
             continue
         seen_codes.add(code)
+        if progress_cb:
+            progress_cb(f"JP quotes (KIS)... {idx}/{total}")
         try:
-            quote = client.get_overseas_stock_quote("TSE", code)
+            quote = client.get_overseas_stock_quote_detail("TSE", code)
         except Exception as exc:
             last_error = str(exc)
             continue

@@ -63,6 +63,13 @@ except Exception:  # pragma: no cover
 DEFAULT_OUTPUT = Path("data") / "uk_fundamentals_cache.jsonl"
 DEFAULT_DOWNLOAD_DIR = Path("data") / "uk_filings"
 DEFAULT_AUDIT_OUTPUT = Path("data") / "uk_cache_build_audit.csv"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
+YAHOO_TIMESERIES_URL = "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json,text/plain,*/*",
+}
 
 ASSUME_ZERO_DEBT_WHEN_MISSING = os.getenv("NET_CASH_ASSUME_ZERO_DEBT", "1").lower() in (
     "1",
@@ -173,6 +180,43 @@ EPS_TAGS = (
     "BasicEarningsLossPerShareFromContinuingOperations",
     "DilutedEarningsLossPerShare",
     "DilutedEarningsLossPerShareFromContinuingOperations",
+)
+
+YAHOO_REVENUE_TYPES = ("annualTotalRevenue", "annualOperatingRevenue")
+YAHOO_OP_INCOME_TYPES = ("annualOperatingIncome",)
+YAHOO_NET_INCOME_TYPES = ("annualNetIncome",)
+YAHOO_EQUITY_TYPES = ("annualStockholdersEquity",)
+YAHOO_LIABILITIES_TYPES = ("annualTotalLiabilitiesNetMinorityInterest",)
+YAHOO_CASH_TYPES = (
+    "annualCashCashEquivalentsAndShortTermInvestments",
+    "annualCashAndCashEquivalents",
+    "annualCashFinancial",
+)
+YAHOO_DEBT_TYPES = (
+    "annualTotalDebt",
+    "annualLongTermDebtAndCapitalLeaseObligation",
+    "annualLongTermDebt",
+    "annualCurrentDebt",
+)
+YAHOO_SHARE_TYPES = (
+    "annualOrdinarySharesNumber",
+    "annualShareIssued",
+    "annualBasicAverageShares",
+    "annualDilutedAverageShares",
+)
+YAHOO_EPS_TYPES = ("annualBasicEPS", "annualDilutedEPS")
+YAHOO_TIMESERIES_TYPES = tuple(
+    dict.fromkeys(
+        YAHOO_REVENUE_TYPES
+        + YAHOO_OP_INCOME_TYPES
+        + YAHOO_NET_INCOME_TYPES
+        + YAHOO_EQUITY_TYPES
+        + YAHOO_LIABILITIES_TYPES
+        + YAHOO_CASH_TYPES
+        + YAHOO_DEBT_TYPES
+        + YAHOO_SHARE_TYPES
+        + YAHOO_EPS_TYPES
+    )
 )
 
 
@@ -1031,6 +1075,457 @@ def compute_net_cash(cash: Optional[float], debt: Optional[float]) -> Tuple[Opti
     return cash - debt, debt
 
 
+def yahoo_symbol_for_uk_ticker(ticker: str) -> str:
+    code = normalize_ticker(ticker)
+    if not code:
+        return ""
+    if code.endswith(".L"):
+        return code
+    return f"{code.replace('.', '-')}.L"
+
+
+def yahoo_raw_value(item: Dict[str, Any]) -> Optional[float]:
+    reported = item.get("reportedValue") if isinstance(item, dict) else None
+    if isinstance(reported, dict):
+        value = reported.get("raw")
+    else:
+        value = item.get("raw") if isinstance(item, dict) else None
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def yahoo_timeseries_year(item: Dict[str, Any]) -> Optional[int]:
+    year = year_from_iso(str(item.get("asOfDate") or ""))
+    if year is not None:
+        return year
+    return year_from_iso(str(item.get("periodEndDate") or ""))
+
+
+def yahoo_quote_major_currency(currency: Any) -> str:
+    raw = str(currency or "").strip()
+    if raw in ("GBp", "GBX"):
+        return "GBP"
+    return raw.upper()
+
+
+def yahoo_price_major_unit(price: Optional[float], currency: Any) -> Optional[float]:
+    if price is None:
+        return None
+    try:
+        price_val = float(price)
+    except Exception:
+        return None
+    if str(currency or "").strip() in ("GBp", "GBX"):
+        return price_val / 100.0
+    return price_val
+
+
+def yahoo_extract_series(payload: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    result = payload.get("timeseries", {}).get("result") if isinstance(payload, dict) else None
+    series: Dict[str, List[Dict[str, Any]]] = {}
+    for block in result or []:
+        types = block.get("meta", {}).get("type") or []
+        type_name = str(types[0]) if types else ""
+        if not type_name:
+            continue
+        items = [item for item in block.get(type_name) or [] if yahoo_raw_value(item) is not None]
+        items.sort(key=lambda item: str(item.get("asOfDate") or item.get("periodEndDate") or ""))
+        series[type_name] = items
+    return series
+
+
+def yahoo_latest_item(
+    series: Dict[str, List[Dict[str, Any]]],
+    types: Sequence[str],
+) -> Tuple[Optional[float], str, str, Optional[int]]:
+    candidates: List[Tuple[str, int, int, float, str, str, Optional[int]]] = []
+    type_rank = {type_name: idx for idx, type_name in enumerate(types)}
+    for type_name in types:
+        for item in series.get(type_name, []):
+            value = yahoo_raw_value(item)
+            if value is None:
+                continue
+            date_text = str(item.get("asOfDate") or item.get("periodEndDate") or "")
+            year = yahoo_timeseries_year(item)
+            candidates.append(
+                (
+                    date_text,
+                    year or 0,
+                    -type_rank[type_name],
+                    value,
+                    type_name,
+                    str(item.get("currencyCode") or ""),
+                    year,
+                )
+            )
+    if not candidates:
+        return None, "", "", None
+    date_text, _year_sort, _rank, value, source_type, currency, year = max(candidates, key=lambda x: (x[0], x[1], x[2]))
+    return value, source_type, currency, year
+
+
+def yahoo_series_by_year(series: Dict[str, List[Dict[str, Any]]], types: Sequence[str]) -> Dict[int, Optional[float]]:
+    out: Dict[int, Tuple[str, int, float]] = {}
+    type_rank = {type_name: idx for idx, type_name in enumerate(types)}
+    for type_name in types:
+        for item in series.get(type_name, []):
+            year = yahoo_timeseries_year(item)
+            value = yahoo_raw_value(item)
+            if not year or value is None:
+                continue
+            candidate = (str(item.get("asOfDate") or item.get("periodEndDate") or ""), -type_rank[type_name], value)
+            existing = out.get(year)
+            if existing is None or candidate[:2] > existing[:2]:
+                out[year] = candidate
+    return {year: value for year, (_date_text, _rank, value) in out.items()}
+
+
+def fetch_yahoo_chart_meta(symbol: str, timeout: int) -> Dict[str, Any]:
+    if requests is None:
+        raise RuntimeError("requests is required for Yahoo fallback")
+    resp = requests.get(
+        YAHOO_CHART_URL.format(symbol=urllib.parse.quote(symbol, safe="")),
+        headers=YAHOO_HEADERS,
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Yahoo chart HTTP {resp.status_code}")
+    payload = resp.json().get("chart", {})
+    error = payload.get("error")
+    if error:
+        raise RuntimeError(f"Yahoo chart error: {error}")
+    results = payload.get("result") or []
+    if not results:
+        raise RuntimeError("Yahoo chart result missing")
+    return results[0].get("meta") or {}
+
+
+def fetch_yahoo_search_symbols(query: str, timeout: int) -> List[str]:
+    if requests is None:
+        raise RuntimeError("requests is required for Yahoo fallback")
+    text = str(query or "").strip()
+    if not text:
+        return []
+    resp = requests.get(
+        YAHOO_SEARCH_URL,
+        headers=YAHOO_HEADERS,
+        params={"q": text, "quotesCount": 8, "newsCount": 0},
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        return []
+    try:
+        payload = resp.json()
+    except Exception:
+        return []
+    symbols: List[str] = []
+    for quote in payload.get("quotes") or []:
+        symbol = str(quote.get("symbol") or "").strip().upper()
+        exchange = str(quote.get("exchange") or quote.get("exchDisp") or "").strip().upper()
+        quote_type = str(quote.get("quoteType") or quote.get("typeDisp") or "").strip().upper()
+        if not symbol:
+            continue
+        if exchange in {"LSE", "LONDON"} or symbol.endswith(".L"):
+            symbols.append(symbol)
+        elif quote_type in {"EQUITY", "ETF"} and symbol.endswith((".IL", ".GB")):
+            symbols.append(symbol)
+    return symbols
+
+
+def yahoo_candidate_symbols(base_record: Dict[str, Any], timeout: int) -> List[str]:
+    direct = yahoo_symbol_for_uk_ticker(str(base_record.get("code") or ""))
+    candidates: List[str] = [direct] if direct else []
+    seen = set()
+    out = []
+    for symbol in candidates:
+        norm = str(symbol or "").strip().upper()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
+
+
+def yahoo_search_candidate_symbols(base_record: Dict[str, Any], timeout: int) -> List[str]:
+    candidates: List[str] = []
+    for query in (
+        base_record.get("isin"),
+        base_record.get("code"),
+        base_record.get("name"),
+    ):
+        try:
+            candidates.extend(fetch_yahoo_search_symbols(str(query or ""), timeout))
+        except Exception:
+            continue
+    seen = set()
+    out = []
+    for symbol in candidates:
+        norm = str(symbol or "").strip().upper()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
+
+
+def fetch_yahoo_timeseries(symbol: str, timeout: int) -> Dict[str, List[Dict[str, Any]]]:
+    if requests is None:
+        raise RuntimeError("requests is required for Yahoo fallback")
+    resp = requests.get(
+        YAHOO_TIMESERIES_URL.format(symbol=urllib.parse.quote(symbol, safe="")),
+        headers=YAHOO_HEADERS,
+        params={
+            "symbol": symbol,
+            "type": ",".join(YAHOO_TIMESERIES_TYPES),
+            "period1": 0,
+            "period2": int(time.time()) + 366 * 24 * 60 * 60,
+        },
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Yahoo timeseries HTTP {resp.status_code}")
+    payload = resp.json()
+    error = payload.get("timeseries", {}).get("error") if isinstance(payload, dict) else None
+    if error:
+        raise RuntimeError(f"Yahoo timeseries error: {error}")
+    return yahoo_extract_series(payload)
+
+
+def build_yahoo_timeseries_cache_record(
+    base_record: Dict[str, Any],
+    *,
+    timeout: int,
+    window_years: int,
+) -> Dict[str, Any]:
+    ticker = normalize_ticker(str(base_record.get("code") or ""))
+    symbols = yahoo_candidate_symbols(base_record, timeout)
+    if not symbols:
+        raise RuntimeError("missing ticker for Yahoo fallback")
+
+    last_error = ""
+    symbol = ""
+    chart_meta: Dict[str, Any] = {}
+    series: Dict[str, List[Dict[str, Any]]] = {}
+    def try_symbols(candidate_symbols: Sequence[str]) -> None:
+        nonlocal symbol, chart_meta, series, last_error
+        for candidate_symbol in candidate_symbols:
+            if symbol:
+                return
+            try:
+                chart_meta = fetch_yahoo_chart_meta(candidate_symbol, timeout)
+                series = fetch_yahoo_timeseries(candidate_symbol, timeout)
+                if not any(series.values()):
+                    raise RuntimeError("Yahoo timeseries has no numeric values")
+                symbol = candidate_symbol
+                return
+            except Exception as exc:
+                last_error = f"{candidate_symbol}: {exc}"
+                continue
+
+    try_symbols(symbols)
+    should_search = any(
+        token in last_error
+        for token in (
+            "Yahoo chart HTTP",
+            "Yahoo chart error",
+            "Yahoo chart result missing",
+        )
+    )
+    if not symbol and should_search:
+        try:
+            fallback_symbols = [s for s in yahoo_search_candidate_symbols(base_record, timeout) if s not in set(symbols)]
+        except Exception:
+            fallback_symbols = []
+        try_symbols(fallback_symbols)
+    if not symbol:
+        raise RuntimeError(last_error or "Yahoo fallback found no usable symbol")
+
+    revenue, revenue_source, revenue_currency, _ = yahoo_latest_item(series, YAHOO_REVENUE_TYPES)
+    op_income, op_source, op_currency, _ = yahoo_latest_item(series, YAHOO_OP_INCOME_TYPES)
+    net_income, net_source, net_currency, _ = yahoo_latest_item(series, YAHOO_NET_INCOME_TYPES)
+    equity, equity_source, equity_currency, _ = yahoo_latest_item(series, YAHOO_EQUITY_TYPES)
+    liabilities, liabilities_source, liabilities_currency, _ = yahoo_latest_item(series, YAHOO_LIABILITIES_TYPES)
+    cash, cash_source, cash_currency, _ = yahoo_latest_item(series, YAHOO_CASH_TYPES)
+    debt, debt_source, debt_currency, _ = yahoo_latest_item(series, YAHOO_DEBT_TYPES)
+    shares, shares_source, _shares_currency, _ = yahoo_latest_item(series, YAHOO_SHARE_TYPES)
+    eps, eps_source, eps_currency, _ = yahoo_latest_item(series, YAHOO_EPS_TYPES)
+
+    if cash is None and all(v is None for v in (revenue, op_income, net_income, equity)):
+        raise RuntimeError("Yahoo timeseries has no usable fundamentals")
+
+    report_currency = (
+        cash_currency
+        or equity_currency
+        or revenue_currency
+        or net_currency
+        or op_currency
+        or liabilities_currency
+        or debt_currency
+        or eps_currency
+    )
+    net_cash, debt_used = compute_net_cash(cash, debt)
+    liabilities_ratio = (liabilities / equity * 100) if liabilities is not None and equity not in (None, 0) else None
+    debt_ratio = (debt_used / equity * 100) if debt_used is not None and equity not in (None, 0) else None
+    net_cash_ps = (net_cash / shares) if net_cash is not None and shares not in (None, 0) else None
+
+    price = chart_meta.get("regularMarketPrice") or chart_meta.get("previousClose")
+    try:
+        price_val = float(price) if price is not None else None
+    except Exception:
+        price_val = None
+    quote_currency = str(chart_meta.get("currency") or "")
+    price_major = yahoo_price_major_unit(price_val, quote_currency)
+    quote_major_currency = yahoo_quote_major_currency(quote_currency)
+    currency_matches = bool(report_currency and quote_major_currency and report_currency.upper() == quote_major_currency.upper())
+
+    per_val = None
+    if currency_matches and price_major is not None:
+        if eps not in (None, 0):
+            per_val = price_major / eps
+        elif shares not in (None, 0) and net_income not in (None, 0):
+            per_val = (price_major * shares) / net_income
+    pbr_val = None
+    if currency_matches and price_major is not None and shares not in (None, 0) and equity not in (None, 0):
+        pbr_val = (price_major * shares) / equity
+    net_cash_ratio = None
+    if currency_matches and net_cash_ps is not None and price_major not in (None, 0):
+        net_cash_ratio = net_cash_ps / price_major * 100
+
+    sales_avg, sales_count, sales_transitions = compute_yoy_average_stats(
+        yahoo_series_by_year(series, YAHOO_REVENUE_TYPES),
+        window_years,
+    )
+    op_avg, op_count, op_transitions = compute_yoy_average_stats(
+        yahoo_series_by_year(series, YAHOO_OP_INCOME_TYPES),
+        window_years,
+    )
+    net_avg, net_count, net_transitions = compute_yoy_average_stats(
+        yahoo_series_by_year(series, YAHOO_NET_INCOME_TYPES),
+        window_years,
+    )
+
+    years = []
+    for type_name in YAHOO_TIMESERIES_TYPES:
+        years.extend(yahoo_timeseries_year(item) for item in series.get(type_name, []))
+    bsns_year = str(max(year for year in years if year)) if any(years) else "-"
+
+    record = dict(base_record)
+    coverage = {
+        "revenue": revenue is not None,
+        "operating_income": op_income is not None,
+        "net_income": net_income is not None,
+        "cash": cash is not None,
+        "equity": equity is not None,
+        "liabilities": liabilities is not None,
+        "interest_bearing_debt": debt_used is not None,
+        "shares": shares is not None,
+    }
+    record.update(
+        {
+            "country": "UK",
+            "code": ticker,
+            "name": chart_meta.get("longName") or chart_meta.get("shortName") or base_record.get("name") or ticker,
+            "price": format_ratio(price_val) if price_val is not None else "N/A",
+            "per": format_ratio(per_val),
+            "pbr": format_ratio(pbr_val),
+            "liabilities_ratio": format_ratio(liabilities_ratio),
+            "interest_bearing_debt_ratio": format_ratio(debt_ratio),
+            "net_cash_per_share": format_per_share(net_cash, shares),
+            "net_cash_per_share_ratio": f"{net_cash_ratio:,.2f}%" if net_cash_ratio is not None else "N/A",
+            "net_cash_per_share_value": net_cash_ps,
+            "sales": format_amount(revenue),
+            "op_income": format_amount(op_income),
+            "equity": format_amount(equity),
+            "sales_growth_5y": build_yoy_average_text(sales_avg, sales_count, sales_transitions),
+            "op_growth_5y": build_yoy_average_text(op_avg, op_count, op_transitions),
+            "net_income_growth_5y": build_yoy_average_text(net_avg, net_count, net_transitions),
+            "sales_growth_5y_avg_pct": sales_avg,
+            "op_growth_5y_avg_pct": op_avg,
+            "net_income_growth_5y_avg_pct": net_avg,
+            "liabilities_ratio_value": liabilities_ratio,
+            "interest_bearing_debt_ratio_value": debt_ratio,
+            "liquid_funds_total": cash,
+            "liquid_funds": cash,
+            "interest_bearing_debt": debt_used,
+            "interest_bearing_debt_source": debt_source or ("assumed_zero" if debt_used == 0.0 and debt is None else ""),
+            "net_cash": net_cash,
+            "net_income": net_income,
+            "shares": shares,
+            "shares_source": f"yahoo:{shares_source}" if shares_source else "",
+            "eps": eps,
+            "eps_source": f"yahoo:{eps_source}" if eps_source else "",
+            "report_currency": report_currency,
+            "currency": quote_currency,
+            "quote_currency": quote_currency,
+            "quote_price_major_unit": price_major,
+            "quote_source": "yahoo-chart",
+            "fundamentals_source": "yahoo-timeseries",
+            "fundamentals_status": "fallback_fundamentals_loaded",
+            "fundamentals_error": "",
+            "source_file": YAHOO_TIMESERIES_URL.format(symbol=symbol),
+            "source_file_count": 1,
+            "coverage": coverage,
+            "bsns_year": bsns_year,
+            "yahoo_symbol": symbol,
+            "yahoo_fundamentals_sources": {
+                "revenue": revenue_source,
+                "operating_income": op_source,
+                "net_income": net_source,
+                "equity": equity_source,
+                "liabilities": liabilities_source,
+                "cash": cash_source,
+                "debt": debt_source,
+                "shares": shares_source,
+            },
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+    )
+    return record
+
+
+def fill_missing_records_from_yahoo_timeseries(
+    records: Dict[str, Dict[str, Any]],
+    *,
+    limit: Optional[int],
+    timeout: int,
+    sleep_seconds: float,
+    window_years: int,
+    audit: List[AuditRow],
+) -> Tuple[int, int]:
+    filled = 0
+    attempted = 0
+    for code, record in list(records.items()):
+        if record.get("fundamentals_status") != "missing_official_fundamentals":
+            continue
+        if limit is not None and attempted >= limit:
+            break
+        attempted += 1
+        try:
+            fallback = build_yahoo_timeseries_cache_record(record, timeout=timeout, window_years=window_years)
+            records[code] = fallback
+            filled += 1
+            audit.append(
+                AuditRow(
+                    code,
+                    str(fallback.get("name") or code),
+                    str(fallback.get("source_file") or ""),
+                    "yahoo_timeseries_fallback",
+                    "ok",
+                    output_record=json.dumps(fallback.get("coverage", {}), ensure_ascii=False),
+                )
+            )
+        except Exception as exc:
+            record["fundamentals_error"] = f"Yahoo timeseries fallback failed: {exc}"
+            audit.append(AuditRow(code, str(record.get("name") or code), "yahoo-timeseries", "yahoo_timeseries_failed", str(exc)))
+        if sleep_seconds:
+            time.sleep(sleep_seconds)
+    return filled, attempted
+
+
 def build_cache_record(ticker: str, name: str, facts: Dict[str, List[Dict[str, Any]]], source_files: Sequence[str], window_years: int) -> Dict[str, Any]:
     revenue = latest_fact(facts, REVENUE_TAGS, annual=True)
     op_income = latest_fact(facts, OP_INCOME_TAGS, annual=True)
@@ -1322,8 +1817,19 @@ def build(args: argparse.Namespace) -> int:
             audit.append(AuditRow(code, company_names.get(code, code), "merged_facts", "record_error", str(exc)))
 
     placeholder_count = seed_universe_placeholders(records, getattr(args, "universe_all_csv", None), audit)
+    yahoo_fallback_count = 0
+    yahoo_fallback_attempted = 0
+    if getattr(args, "yahoo_timeseries_fallback_missing", False):
+        yahoo_fallback_count, yahoo_fallback_attempted = fill_missing_records_from_yahoo_timeseries(
+            records,
+            limit=args.yahoo_timeseries_fallback_limit,
+            timeout=args.yahoo_timeseries_timeout,
+            sleep_seconds=args.yahoo_timeseries_sleep,
+            window_years=args.years,
+            audit=audit,
+        )
 
-    if built or placeholder_count:
+    if built or placeholder_count or yahoo_fallback_count:
         write_jsonl_atomic(output_path, records)
     write_audit(Path(args.audit_output), audit)
 
@@ -1332,9 +1838,11 @@ def build(args: argparse.Namespace) -> int:
     print(f"Built/updated records: {built}")
     if placeholder_count:
         print(f"Missing official fundamentals placeholders: {placeholder_count}")
+    if getattr(args, "yahoo_timeseries_fallback_missing", False):
+        print(f"Yahoo timeseries fallback filled: {yahoo_fallback_count}/{yahoo_fallback_attempted}")
     print(f"Output: {output_path}")
     print(f"Audit: {args.audit_output}")
-    return 0 if built or placeholder_count else 1
+    return 0 if built or placeholder_count or yahoo_fallback_count else 1
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1356,6 +1864,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--strict-official", action=argparse.BooleanOptionalAction, default=True, help="Allow downloads only from FCA official domains; default true")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
     parser.add_argument("--sleep", type=float, default=0.2, help="Sleep seconds between downloads")
+    parser.add_argument("--yahoo-timeseries-fallback-missing", action="store_true", help="Fill missing UK universe placeholders from Yahoo fundamentals time-series")
+    parser.add_argument("--yahoo-timeseries-fallback-limit", type=int, help="Limit Yahoo fallback rows for smoke tests")
+    parser.add_argument("--yahoo-timeseries-timeout", type=int, default=15, help="Yahoo fallback HTTP timeout seconds")
+    parser.add_argument("--yahoo-timeseries-sleep", type=float, default=0.05, help="Sleep seconds between Yahoo fallback rows")
     parser.add_argument("--write-example-manifest", help="Write an example manifest CSV then exit")
     return parser.parse_args(argv)
 

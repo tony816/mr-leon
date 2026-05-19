@@ -412,6 +412,91 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertEqual(record["shares_source"], "eps_inferred")
         self.assertAlmostEqual(record["shares"], 1_000_000.0)
 
+    def test_uk_yahoo_timeseries_fallback_populates_missing_placeholder(self):
+        placeholder = build_uk_cache_db.universe_placeholder_record(
+            {
+                "ticker": "ABC",
+                "name": "ABC PLC",
+                "isin": "GB00ABC",
+                "market": "AIM",
+                "instrument_type": "ORD 1P",
+            }
+        )
+        chart_payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": "ABC.L",
+                            "longName": "ABC PLC",
+                            "currency": "GBp",
+                            "regularMarketPrice": 250.0,
+                        }
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        def item(type_name, date, raw, currency="GBP"):
+            return {
+                "meta": {"type": [type_name]},
+                type_name: [
+                    {
+                        "asOfDate": date,
+                        "periodType": "12M",
+                        "currencyCode": currency,
+                        "reportedValue": {"raw": raw, "fmt": str(raw)},
+                    }
+                ],
+            }
+
+        timeseries_payload = {
+            "timeseries": {
+                "result": [
+                    item("annualTotalRevenue", "2025-12-31", 1000),
+                    item("annualOperatingIncome", "2025-12-31", 200),
+                    item("annualNetIncome", "2025-12-31", 150),
+                    item("annualStockholdersEquity", "2025-12-31", 500),
+                    item("annualTotalLiabilitiesNetMinorityInterest", "2025-12-31", 300),
+                    item("annualCashCashEquivalentsAndShortTermInvestments", "2025-12-31", 400),
+                    item("annualTotalDebt", "2025-12-31", 100),
+                    item("annualOrdinarySharesNumber", "2025-12-31", 100),
+                    item("annualBasicEPS", "2025-12-31", 1.5),
+                ],
+                "error": None,
+            }
+        }
+
+        class Response:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **_kwargs):
+            if "/v8/finance/chart/" in url:
+                return Response(chart_payload)
+            return Response(timeseries_payload)
+
+        with patch.object(build_uk_cache_db.requests, "get", side_effect=fake_get):
+            record = build_uk_cache_db.build_yahoo_timeseries_cache_record(
+                placeholder,
+                timeout=5,
+                window_years=5,
+            )
+
+        self.assertEqual(record["fundamentals_status"], "fallback_fundamentals_loaded")
+        self.assertEqual(record["fundamentals_source"], "yahoo-timeseries")
+        self.assertEqual(record["net_cash"], 300.0)
+        self.assertEqual(record["net_cash_per_share_value"], 3.0)
+        self.assertEqual(record["net_cash_per_share_ratio"], "120.00%")
+        self.assertEqual(record["per"], "1.67")
+        self.assertTrue(record["coverage"]["cash"])
+
     def test_nsm_name_matching_normalizes_dotted_plc(self):
         row = collect_uk_ch_and_build_cache.LseRow(
             ticker="BP",
@@ -528,6 +613,64 @@ class RangeScanCacheTests(unittest.TestCase):
         rows = collect_uk_ch_and_build_cache.lse_rows_missing_nsm_esef([matched, missing], reports)
 
         self.assertEqual(rows, [missing])
+
+    def test_lse_company_share_filter_excludes_etfs_and_non_uk_rows(self):
+        company = collect_uk_ch_and_build_cache.LseRow(
+            ticker="ABC",
+            name="ABC PLC",
+            isin="GB00ABC",
+            market="AIM",
+            instrument_type="ORD 1P",
+            raw={
+                "MiFIR Identifier Code": "SHRS",
+                "MiFIR Indentifier Name": "Shares",
+                "Country of Incorporation": "United Kingdom",
+                "FCA Listing Category": "Equity shares (commercial companies)",
+            },
+        )
+        etf = collect_uk_ch_and_build_cache.LseRow(
+            ticker="ETF",
+            name="ETF ISSUER PLC",
+            isin="IE00ETF",
+            market="MAIN MARKET",
+            instrument_type="UCITS ETF",
+            raw={
+                "MiFIR Identifier Code": "ETFS",
+                "MiFIR Indentifier Name": "Exchange Traded Funds",
+                "Country of Incorporation": "Ireland",
+            },
+        )
+        fund = collect_uk_ch_and_build_cache.LseRow(
+            ticker="FND",
+            name="FUND PLC",
+            isin="GB00FND",
+            market="MAIN MARKET",
+            instrument_type="ORD 1P",
+            raw={
+                "MiFIR Identifier Code": "SHRS",
+                "Country of Incorporation": "United Kingdom",
+                "FCA Listing Category": "Closed-ended investment funds",
+            },
+        )
+        foreign_company = collect_uk_ch_and_build_cache.LseRow(
+            ticker="FOR",
+            name="FOREIGN PLC",
+            isin="JE00FOR",
+            market="MAIN MARKET",
+            instrument_type="ORD NPV",
+            raw={
+                "MiFIR Identifier Code": "SHRS",
+                "Country of Incorporation": "Jersey",
+                "FCA Listing Category": "Equity shares (commercial companies)",
+            },
+        )
+
+        self.assertTrue(collect_uk_ch_and_build_cache.is_lse_company_share_row(company))
+        self.assertTrue(collect_uk_ch_and_build_cache.is_lse_uk_incorporated_row(company))
+        self.assertFalse(collect_uk_ch_and_build_cache.is_lse_company_share_row(etf))
+        self.assertFalse(collect_uk_ch_and_build_cache.is_lse_company_share_row(fund))
+        self.assertTrue(collect_uk_ch_and_build_cache.is_lse_company_share_row(foreign_company))
+        self.assertFalse(collect_uk_ch_and_build_cache.is_lse_uk_incorporated_row(foreign_company))
 
     def test_cached_scan_batches_quotes_without_official_detail_calls(self):
         records = [
