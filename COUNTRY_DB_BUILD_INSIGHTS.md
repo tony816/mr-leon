@@ -2,6 +2,77 @@
 
 Last updated: 2026-05-19
 
+## JP cache/range-scan lessons reusable for other countries
+
+### 1. Treat universe completeness and fundamentals availability as different problems
+
+JP에서 가장 먼저 드러난 문제는 `jp_fundamentals_cache.jsonl`가 9691에서 끝나면서 9692~9997 구간의 회사 종목이 통째로 빠진 것이었다. 이건 재무 수집 품질 문제가 아니라 universe completeness 문제다.
+
+다른 국가 DB를 만들 때도 먼저 공식 거래소 universe를 기준으로 `target_count`, `cache_unique_count`, `missing_count`, `extra/non-company_count`, `duplicate_count`를 따로 검산해야 한다. 재무가 없는 종목이라도 상장 universe에는 들어가야 하며, 이 경우 row를 버리지 말고 `fundamentals_status = missing_official_fundamentals` 같은 상태로 남겨야 한다.
+
+### 2. "No statements" does not always mean a broken API
+
+JP 누락분 중 앞쪽 29개는 외국회사, 종류주/우선주성 코드, 신규 알파벳 코드라 J-Quants financial statements가 없거나 아직 제공되지 않는 경우가 있었다. 반면 9697 CAPCOM, 9983 FAST RETAILING, 9984 SoftBank Group 같은 기존 4자리 회사는 정상적으로 재무를 받았다.
+
+DB 빌더는 `official_fundamentals_loaded`, `listing_only`, `missing_official_fundamentals`, `unavailable_fundamentals`를 구분해야 한다. 그래야 누락 검산, range scan 제외, 수동 보정 대상을 정확히 나눌 수 있다.
+
+### 3. Symbol normalization must preserve instrument identity
+
+JP에서 `25935`, `50765`, `75505`, `92025`, `94345`, `94346` 같은 5자리 종류주/클래스주 코드가 4자리 보통주 코드로 잘리면 중복과 오염이 생긴다. 일반 4자리 코드에 붙은 거래소 suffix나 feed suffix는 제거해야 하지만, 실제 상장 코드인 5자리 instrument code는 보존해야 한다.
+
+다른 국가에서도 exchange code, quote symbol, issuer id, share-class id를 한 필드로 뭉개지 말아야 한다. `issuer`와 `instrument`를 구분하고, dedupe 기준이 issuer인지 instrument인지 명시해야 한다.
+
+### 4. Append-only partial builds need a final dedupe/audit pass
+
+누락분만 append하는 방식은 API 제한이 강한 환경에서 실용적이다. 하지만 기존 중복 그룹은 그대로 남는다. 부분 빌드 후에는 반드시 전체 행 수, 고유 코드 수, 공식 universe 대비 누락, extra/non-company code, duplicate code groups, status별 row count를 다시 계산해야 한다.
+
+### 5. Range scan should not depend on an unreliable quote provider
+
+JP Range Scan이 느리고 0건이 나온 핵심 원인은 Yahoo quote 429였다. Yahoo 실패를 조용히 무시하면 사용자는 "조건에 맞는 종목이 없다"고 오해한다.
+
+국가별 Range Scan은 해당 국가의 공식/브로커 quote API를 우선 사용하고, Yahoo 같은 비공식 provider는 보조 소스로만 둬야 한다. quote enrichment가 전부 실패하면 0건으로 끝내지 말고 error/status에 실패 원인을 표시해야 한다.
+
+JP에서는 KIS `해외주식 현재가상세` API가 적합했다.
+
+- endpoint: `/uapi/overseas-price/v1/quotations/price-detail`
+- TR ID: `HHDFS76200200`
+- exchange code: `TSE`
+- useful fields: `last`, `perx`, `pbrx`, `epsx`, `bpsx`, `shar`, `tomv`, `curr`
+
+현재체결가 API처럼 가격만 주는 API는 Range Scan 필터에는 부족하다. 가능하면 PER/PBR/EPS/BPS/상장주수/시총을 같이 주는 상세시세 API를 찾아야 한다.
+
+### 6. Cache must store enough fields to avoid live quote calls
+
+기존 JP 캐시는 `sales`, `op_income`, `equity`, `cash`, `debt`, `shares`는 있었지만 `net_income`, `eps`, `bps`, `price`가 없었다. 그래서 KIS나 Yahoo가 가격만 줘도 PER/PBR을 계산할 수 없었고, 기본 필터에서 전부 탈락했다.
+
+다른 국가 캐시에도 최소한 `price`, `per`, `pbr`, `eps`, `bps`, `net_income`, `equity`, `shares`, `cash/liquid_funds`, `interest_bearing_debt`, `net_cash`, `net_cash_per_share_value`, `quote_currency`, `report_currency`, `quote_source`, `fundamentals_source`, `coverage/status`를 저장해야 한다.
+
+quote provider가 PER/PBR을 안 주더라도 `price / eps`, `price / bps`, `market_cap / net_income`, `market_cap / equity`로 재계산할 수 있게 해야 한다.
+
+### 7. Prefilter before quote enrichment
+
+JP에서 기본 조건 기준으로 전체 3,857개를 바로 quote 조회하면 느리고 rate limit에 취약하다. 정적 재무조건으로 먼저 줄이면 quote 후보가 약 86개까지 줄었다.
+
+다른 국가에서도 quote API 호출 전에 liabilities/equity, interest-bearing debt/equity, net cash sign, growth availability, placeholder/unavailable exclusion처럼 캐시만으로 판정 가능한 조건을 먼저 적용해야 한다. 그 다음 PER/PBR/net-cash-ratio처럼 quote가 필요한 항목만 live enrichment를 수행한다.
+
+### 8. Rate limits and token limits are part of the DB design
+
+JP 작업 중 확인된 제한:
+
+- J-Quants는 요청 간격이 길어 대량 전체 rebuild가 오래 걸린다.
+- KIS token 발급은 `1분당 1회` 제한이 있어 새 프로세스를 자주 띄우면 `EGW00133`이 난다.
+- Yahoo는 batch quote에서도 429가 쉽게 발생한다.
+
+빌더는 token을 프로세스 내에서 공유/cache하고, 전체 rebuild는 기존 파일을 직접 덮지 말고 `*_priced.jsonl` 같은 새 파일로 만든 뒤 검증 후 교체해야 한다. partial build와 resume도 가능해야 한다.
+
+### 9. Error messages must distinguish "0 matches" from "quote failed"
+
+JP Range Scan에서 `Done: 0 matches`와 `last error: HTTP 429`가 같이 보였는데, 이건 검색 결과 0개가 아니라 quote enrichment 실패다. UI/status는 `cache prefilter`, `quote progress`, `quote enrichment failed`, `scan complete after successful enrichment`를 구분해서 보여줘야 한다.
+
+### 10. Keep reproducible audit artifacts
+
+JP 누락 확인에는 `missing_company_symbols_jpx_202604.csv`, duplicate list, non-company/extra list가 유용했다. 다른 국가도 build output과 별도로 `missing_company_symbols_<country>_<date>.csv`, `duplicate_codes_<country>.csv`, `extra_or_non_company_codes_<country>.csv`, `build_summary_<country>.json`, `quote_enrichment_failures_<country>.csv`를 남기는 편이 좋다.
+
 이 문서는 UK fundamentals cache 문제를 해결하면서 얻은 인사이트를 다른 국가 DB 구축에도 재사용하기 위한 메모다. 핵심은 "전체 상장 universe", "공식 재무 소스", "보조/대체 소스", "스캔 가능한 최종 캐시"를 분리해서 설계하는 것이다.
 
 ## 1. Universe 정의를 먼저 고정한다
@@ -184,4 +255,3 @@ UK에서 사용한 방식:
 - range scan은 missing/unavailable을 제외하고 정상 record만 반환한다.
 - net cash, liabilities ratio, debt ratio, PER/PBR 필터가 캐시 전체에서 예외 없이 동작한다.
 - 남은 수동/unavailable 항목은 사람이 검토 가능한 CSV로 관리된다.
-
