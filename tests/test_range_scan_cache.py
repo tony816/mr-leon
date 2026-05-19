@@ -652,6 +652,29 @@ class RangeScanCacheTests(unittest.TestCase):
                 "FCA Listing Category": "Closed-ended investment funds",
             },
         )
+        income_fund = collect_uk_ch_and_build_cache.LseRow(
+            ticker="IFD",
+            name="INCOME FUND LIMITED",
+            isin="GG00IFD",
+            market="MAIN MARKET - SFS",
+            instrument_type="ORD NPV",
+            raw={
+                "MiFIR Identifier Code": "SHRS",
+                "Country of Incorporation": "Guernsey",
+            },
+        )
+        preference = collect_uk_ch_and_build_cache.LseRow(
+            ticker="PRF",
+            name="PREFERENCE PLC",
+            isin="GB00PRF",
+            market="MAIN MARKET",
+            instrument_type="3 1/2% GTD PRF STK",
+            raw={
+                "MiFIR Identifier Code": "SHRS",
+                "Country of Incorporation": "United Kingdom",
+                "FCA Listing Category": "Non-equity shares and non-voting equity shares",
+            },
+        )
         foreign_company = collect_uk_ch_and_build_cache.LseRow(
             ticker="FOR",
             name="FOREIGN PLC",
@@ -669,6 +692,8 @@ class RangeScanCacheTests(unittest.TestCase):
         self.assertTrue(collect_uk_ch_and_build_cache.is_lse_uk_incorporated_row(company))
         self.assertFalse(collect_uk_ch_and_build_cache.is_lse_company_share_row(etf))
         self.assertFalse(collect_uk_ch_and_build_cache.is_lse_company_share_row(fund))
+        self.assertFalse(collect_uk_ch_and_build_cache.is_lse_company_share_row(income_fund))
+        self.assertFalse(collect_uk_ch_and_build_cache.is_lse_company_share_row(preference))
         self.assertTrue(collect_uk_ch_and_build_cache.is_lse_company_share_row(foreign_company))
         self.assertFalse(collect_uk_ch_and_build_cache.is_lse_uk_incorporated_row(foreign_company))
 

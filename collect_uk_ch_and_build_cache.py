@@ -784,11 +784,13 @@ def is_lse_company_share_row(item: LseRow) -> bool:
         return False
     if any(hint in text for hint in ("ETF", "ETC", "ETN", "EXCHANGE TRADED", "OPEN-ENDED INVESTMENT")):
         return False
-    if any(hint in text for hint in ("CLOSED-ENDED INVESTMENT FUND", "INVESTMENT FUNDS")):
+    if any(hint in text for hint in ("CLOSED-ENDED INVESTMENT FUND", "INVESTMENT FUNDS", " INCOME FUND", " FUND ")):
         return False
     if any(hint in text for hint in ("DEPOSITARY RECEIPT", "DEPOSITORY RECEIPT", "CERTIFICATE")):
         return False
-    if any(hint in text for hint in ("BOND", "NOTE", "DEBT", "WARRANT", "GILT", "TREASURY", "PREFERENCE", "PREF")):
+    if "NON-EQUITY" in listing_category:
+        return False
+    if any(hint in text for hint in ("BOND", "NOTE", "DEBT", "WARRANT", "GILT", "TREASURY", "PREFERENCE", "PREF", " PRF")):
         return False
     return bool(item.ticker and item.name)
 
